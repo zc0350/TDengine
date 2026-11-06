@@ -8,14 +8,15 @@
 #include "msInt.h"
 
 struct SMsSrc {
-  SMsCfg         cfg;
-  SMsSink       *sink;
+  SMsCfg           cfg;
+  SMsSink         *sink;
   volatile int32_t stop;
-  SMsStats       stats;
-  char         **batch;
-  int32_t        batchNum;
-  int32_t        batchCap;
-  int64_t        lastFlushMs;
+  int32_t          failedBatches;
+  SMsStats         stats;
+  char           **batch;
+  int32_t          batchNum;
+  int32_t          batchCap;
+  int64_t          lastFlushMs;
 };
 
 static char *dupLine(const char *p) {
@@ -30,8 +31,9 @@ static void freeBatch(SMsSrc *src) {
   src->batchNum = 0;
 }
 
-static void flushBatch(SMsSrc *src) {
-  if (src->batchNum <= 0) return;
+/* Returns 0 only when the batch was accepted by the sink. */
+static int32_t flushBatch(SMsSrc *src) {
+  if (src->batchNum <= 0) return 0;
   int32_t n = src->batchNum;
   int32_t rc = msSinkWrite(src->sink, src->batch, n);
   ++src->stats.flushes;
@@ -39,15 +41,16 @@ static void flushBatch(SMsSrc *src) {
     src->stats.written += (uint64_t)n;
   } else {
     src->stats.failed += (uint64_t)n;
+    ++src->failedBatches;
     msLog(MS_LOG_ERROR, "batch of %d row(s) dropped after retries", n);
   }
   freeBatch(src);
   src->lastFlushMs = msNowMs();
+  return rc;
 }
 
-static void onMessage(void *arg, const char *topic, const uint8_t *payload,
-                      int32_t len, int32_t qos, int32_t packetId) {
-  (void)qos;
+static int32_t onMessage(void *arg, const char *topic, const uint8_t *payload,
+                         int32_t len, int32_t qos, int32_t packetId) {
   (void)packetId;
   SMsSrc *src = (SMsSrc *)arg;
   ++src->stats.received;
@@ -59,26 +62,40 @@ static void onMessage(void *arg, const char *topic, const uint8_t *payload,
                    &lines, &num, err, sizeof(err)) != 0) {
     ++src->stats.parseErrors;
     msLog(MS_LOG_WARN, "drop message on topic '%s': %s", topic, err);
-    return;
+    /* Malformed input is dropped deliberately: never stall the broker. */
+    return 0;
   }
 
+  int32_t failed = 0;
   const char *p = lines;
   for (int32_t i = 0; i < num; ++i) {
     char *line = dupLine(p);
     p += strlen(p) + 1;
-    if (line == NULL) continue;
+    if (line == NULL) {
+      failed = -1;
+      continue;
+    }
+    if (src->batchNum >= src->batchCap && flushBatch(src) != 0) failed = -1;
     src->batch[src->batchNum++] = line;
     ++src->stats.lines;
     ++src->stats.parsed;
-    if (src->batchNum >= src->cfg.sink.batchSize) flushBatch(src);
+    if (src->batchNum >= src->batchCap && flushBatch(src) != 0) failed = -1;
   }
   free(lines);
+
+  if (qos > 0) {
+    /* QoS 1/2 may only be acknowledged after these rows are durably written.
+     * Force the flush here; a failure is propagated so the broker redelivers. */
+    if (flushBatch(src) != 0) failed = -1;
+    return failed;
+  }
+  return 0; /* QoS 0 has no delivery guarantee; keep batching */
 }
 
 static void onTick(void *arg) {
   SMsSrc *src = (SMsSrc *)arg;
   if (src->batchNum > 0 && msNowMs() - src->lastFlushMs >= src->cfg.sink.flushMs) {
-    flushBatch(src);
+    (void)flushBatch(src);
   }
 }
 
@@ -105,7 +122,7 @@ int32_t msSrcRun(const SMsCfg *cfg, SMsSrc **ppSrc) {
 
   if (msSinkOpen(&cfg->sink, cfg->mapping.tbnameKey, &src->sink) != 0) {
     msLog(MS_LOG_ERROR, "cannot open TDengine sink");
-    src->stop = 1;
+    MS_ATOMIC_STORE(&src->stop, 1);
     return -1;
   }
 
@@ -119,7 +136,7 @@ int32_t msSrcRun(const SMsCfg *cfg, SMsSrc **ppSrc) {
   opts.reconnects = &src->stats.reconnects;
 
   int32_t rc = msMqttLoop(&opts);
-  flushBatch(src); /* drain whatever is left before exit */
+  int32_t finalFlush = flushBatch(src); /* drain whatever is left before exit */
   msSinkClose(src->sink);
   src->sink = NULL;
 
@@ -130,11 +147,17 @@ int32_t msSrcRun(const SMsCfg *cfg, SMsSrc **ppSrc) {
         (unsigned long long)src->stats.written, (unsigned long long)src->stats.failed,
         (unsigned long long)src->stats.parseErrors,
         (unsigned long long)src->stats.reconnects);
-  return rc;
+  /* A non-zero exit code lets systemd / a supervisor notice lost rows. */
+  if (rc != 0 || finalFlush != 0 || src->failedBatches != 0) {
+    msLog(MS_LOG_ERROR, "stopped with %d failed batch(es); some data was not written",
+          src->failedBatches);
+    return -1;
+  }
+  return 0;
 }
 
 void msSrcStop(SMsSrc *src) {
-  if (src != NULL) src->stop = 1;
+  if (src != NULL) MS_ATOMIC_STORE(&src->stop, 1);
 }
 
 void msSrcStats(SMsSrc *src, SMsStats *stats) {

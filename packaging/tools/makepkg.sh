@@ -115,6 +115,7 @@ else
       ${build_dir}/bin/${clientName}keeper \
       ${build_dir}/bin/taosudf \
       ${build_dir}/bin/taosmqtt \
+      ${build_dir}/bin/taosmqttsrc \
       ${script_dir}/remove.sh \
       ${script_dir}/set_core.sh \
       ${script_dir}/startPre.sh \
@@ -139,7 +140,7 @@ else
     pkg_nativelib_files="libtaosnative.so.${version}"
     pkg_wslib_files="libtaosws.so.${version}"
 fi
-header_files="${code_dir}/include/client/taos.h ${code_dir}/include/common/taosdef.h ${code_dir}/include/util/taoserror.h ${code_dir}/include/util/tdef.h ${code_dir}/include/libs/function/taosudf.h"
+header_files="${code_dir}/include/client/taos.h ${code_dir}/include/common/taosdef.h ${code_dir}/include/util/taoserror.h ${code_dir}/include/util/tdef.h ${code_dir}/include/libs/function/taosudf.h ${code_dir}/include/libs/mqttsrc/mqttsrc.h"
 
 wsheader_files="${build_dir}/taos-connector-rust/output/taosws.h"
 if [ ! -f "${wsheader_files}" ]; then
@@ -339,6 +340,11 @@ if [[ $dbName == "taos" ]]; then
     mkdir -p "${install_dir}/examples/${ex_dst}/$(dirname "${ex_rel}")"
     cp "${examples_dir}/${ex_src}" "${install_dir}/examples/${ex_dst}/${ex_rel}"
   done < "${examples_manifest}"
+
+  # MQTT data source sample configs (not part of docs/examples).
+  mkdir -p "${install_dir}/examples/mqttsrc"
+  cp "${top_dir}/source/libs/mqttsrc/conf/"*.example.json \
+     "${install_dir}/examples/mqttsrc/"
 
   if [[ "$pagMode" != "lite" ]] && [[ "$cpuType" != "aarch32" ]]; then
     if [ -d ${examples_dir}/JDBC/connectionPools/target ]; then

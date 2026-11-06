@@ -24,6 +24,7 @@ typedef struct tools_cJSON tools_cJSON;
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <intrin.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
@@ -38,6 +39,21 @@ typedef struct tools_cJSON tools_cJSON;
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Stop/handle publication between the signal/console thread and the loop.
+ * Compiler builtins avoid a dependency on C11 <stdatomic.h> (MSVC would need
+ * /std:c11) while still giving seq-cst ordering and signal-safe stores. */
+#if defined(_MSC_VER)
+#define MS_ATOMIC_STORE(p, v) _InterlockedExchange((volatile long *)(p), (long)(v))
+#define MS_ATOMIC_LOAD(p)     _InterlockedCompareExchange((volatile long *)(p), 0, 0)
+#elif defined(__GNUC__) || defined(__clang__)
+#define MS_ATOMIC_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+#define MS_ATOMIC_LOAD(p)     __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#else
+#define MS_ATOMIC_STORE(p, v) (*(p) = (v))
+#define MS_ATOMIC_LOAD(p)     (*(p))
+#endif
+#define MS_STOPPED(stop)      (MS_ATOMIC_LOAD(stop) != 0)
 
 #define MS_LOG_DEBUG 0
 #define MS_LOG_INFO  1
@@ -67,6 +83,10 @@ int32_t ssPutChar(SStr *s, char c);
 int32_t ssPrintf(SStr *s, const char *fmt, ...);
 /* mode 1: measurement / tag key / tag value; mode 2: quoted field value */
 int32_t ssPutEscaped(SStr *s, const char *p, int32_t mode);
+/* Length-aware variant: also handles embedded NUL / control bytes, which a
+ * NUL-terminated payload may legitimately contain. Control bytes are replaced
+ * by spaces so they cannot terminate or break the line protocol. */
+int32_t ssPutEscapedN(SStr *s, const char *p, int32_t n, int32_t mode);
 /* append NUL and hand the buffer to the caller (caller frees with free()) */
 char   *ssDetach(SStr *s);
 
@@ -92,8 +112,11 @@ typedef struct {
 int32_t msJsonPath(tools_cJSON *root, const char *path, SMsValue *val);
 
 /* ---------------- MQTT client ---------------- */
-typedef void (*MsMsgCb)(void *arg, const char *topic, const uint8_t *payload,
-                        int32_t len, int32_t qos, int32_t packetId);
+/* Return 0 when the message is durably accepted, non-zero when it must NOT
+ * be acknowledged: the broker is then expected to redeliver the PUBLISH.
+ * Malformed messages should still return 0 (drop + count, never stall). */
+typedef int32_t (*MsMsgCb)(void *arg, const char *topic, const uint8_t *payload,
+                           int32_t len, int32_t qos, int32_t packetId);
 typedef void (*MsTickCb)(void *arg);
 
 typedef struct {

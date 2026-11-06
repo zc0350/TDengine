@@ -424,11 +424,14 @@ int32_t transResetBuffer(SConnBuffer* connBuf, int8_t resetBuf) {
     p->len = 0;
     if (p->cap > BUFFER_CAP) {
       if (resetBuf) {
-        p->cap = BUFFER_CAP;
-        p->buf = taosMemoryRealloc(p->buf, p->cap);
-        if (p->buf == NULL) {
+        /* Keep the original buffer when realloc fails: overwriting p->buf
+         * with NULL leaks it and leaves the connection unusable. */
+        char *newBuf = taosMemoryRealloc(p->buf, BUFFER_CAP);
+        if (newBuf == NULL) {
           return terrno;
         }
+        p->buf = newBuf;
+        p->cap = BUFFER_CAP;
       }
     }
   } else {
@@ -452,13 +455,22 @@ int32_t transAllocBuffer(SConnBuffer* connBuf, uv_buf_t* uvBuf) {
     if (p->left < p->cap - p->len) {
       uvBuf->len = p->left;
     } else {
-      p->cap = p->left + p->len;
-      p->buf = taosMemoryRealloc(p->buf, p->cap);
-      if (p->buf == NULL) {
+      /* Guard the addition before growing, and never overwrite p->buf with a
+       * failed realloc result (the old buffer would be leaked). */
+      int64_t newCap = (int64_t)p->left + p->len;
+      if (newCap <= 0 || newCap >= (int64_t)TRANS_MSG_LIMIT) {
+        uvBuf->base = NULL;
+        uvBuf->len = 0;
+        return TSDB_CODE_INVALID_MSG_LEN;
+      }
+      char *newBuf = taosMemoryRealloc(p->buf, (int32_t)newCap);
+      if (newBuf == NULL) {
         uvBuf->base = NULL;
         uvBuf->len = 0;
         return terrno;
       }
+      p->buf = newBuf;
+      p->cap = (int32_t)newCap;
       uvBuf->base = p->buf + p->len;
       uvBuf->len = p->left;
     }
@@ -474,7 +486,12 @@ bool transReadComplete(SConnBuffer* connBuf) {
       memcpy((char*)&head, connBuf->buf, sizeof(head));
       int32_t msgLen = (int32_t)ntohl(head.msgLen);
       p->total = msgLen;
-      p->invalid = (head.version != TRANS_VER || msgLen >= TRANS_MSG_LIMIT);
+      /* Reject negative/undersized lengths at the entry point: ntohl() can
+       * yield a negative int32_t, which would otherwise bypass the upper
+       * bound and rely on a later layer to notice. */
+      p->invalid = (head.version != TRANS_VER ||
+                    msgLen < (int32_t)sizeof(STransMsgHead) ||
+                    msgLen >= (int32_t)TRANS_MSG_LIMIT);
       if (p->invalid) {
         tError("recv invalid msg, version:%d, expect:%d, msg len %d, limit:%d", head.version, TRANS_VER, msgLen, (int)(TRANS_MSG_LIMIT));
       }
@@ -1918,11 +1935,14 @@ int32_t transResetBuffer(SConnBuffer* connBuf, int8_t resetBuf) {
     p->len = 0;
     if (p->cap > BUFFER_CAP) {
       if (resetBuf) {
-        p->cap = BUFFER_CAP;
-        p->buf = taosMemoryRealloc(p->buf, p->cap);
-        if (p->buf == NULL) {
+        /* Keep the original buffer when realloc fails: overwriting p->buf
+         * with NULL leaks it and leaves the connection unusable. */
+        char *newBuf = taosMemoryRealloc(p->buf, BUFFER_CAP);
+        if (newBuf == NULL) {
           return terrno;
         }
+        p->buf = newBuf;
+        p->cap = BUFFER_CAP;
       }
     }
   } else {

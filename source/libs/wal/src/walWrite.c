@@ -117,22 +117,25 @@ int64_t walChangeWrite(SWal *pWal, int64_t ver) {
   int       code;
   TdFilePtr pIdxTFile, pLogTFile;
   char      fnameStr[WAL_FILE_LEN];
+  /* The caller uses TAOS_CHECK_EXIT_SET_CODE(), whose failure branch replaces
+   * `code` with terrno. Return a real error code AND set terrno so the
+   * diagnostic is not lost or replaced by a stale value. */
   if (pWal->pLogFile != NULL) {
     if (pWal->cfg.level != TAOS_WAL_SKIP && (code = taosFsyncFile(pWal->pLogFile)) != 0) {
-      return -1;
+      TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
     }
     code = taosCloseFile(&pWal->pLogFile);
     if (code != 0) {
-      return -1;
+      TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
     }
   }
   if (pWal->pIdxFile != NULL) {
     if (pWal->cfg.level != TAOS_WAL_SKIP && (code = taosFsyncFile(pWal->pIdxFile)) != 0) {
-      return -1;
+      TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
     }
     code = taosCloseFile(&pWal->pIdxFile);
     if (code != 0) {
-      return -1;
+      TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
     }
   }
 
@@ -148,16 +151,14 @@ int64_t walChangeWrite(SWal *pWal, int64_t ver) {
   pIdxTFile = taosOpenFile(fnameStr, TD_FILE_CREATE | TD_FILE_WRITE | TD_FILE_APPEND);
   if (pIdxTFile == NULL) {
     pWal->pIdxFile = NULL;
-
-    return -1;
+    TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
   }
   walBuildLogName(pWal, fileFirstVer, fnameStr);
   pLogTFile = taosOpenFile(fnameStr, TD_FILE_CREATE | TD_FILE_WRITE | TD_FILE_APPEND);
   if (pLogTFile == NULL) {
     TAOS_UNUSED(taosCloseFile(&pIdxTFile));
     pWal->pLogFile = NULL;
-
-    return -1;
+    TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED);
   }
 
   pWal->pLogFile = pLogTFile;

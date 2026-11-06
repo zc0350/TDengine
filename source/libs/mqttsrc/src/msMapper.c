@@ -14,6 +14,9 @@
 #include "msInt.h"
 #include "toolscJson.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <time.h>
 
 /* Effective table model for one record. Points into the config, never copies
@@ -189,9 +192,10 @@ static bool whenMatch(const SMsWhen *w, SMsCtx *ctx) {
   if (!exists) return false;
   switch (w->op) {
     case MS_WHEN_NE:       return strcmp(val, w->value) != 0;
-    case MS_WHEN_PREFIX:   return strncmp(val, w->value, strlen(w->value)) == 0;
-    case MS_WHEN_CONTAINS: return strstr(val, w->value) != NULL;
-    case MS_WHEN_IN:       return inList(w->value, val);
+    case MS_WHEN_PREFIX:   return w->value[0] != '\0' &&
+                                  strncmp(val, w->value, strlen(w->value)) == 0;
+    case MS_WHEN_CONTAINS: return w->value[0] != '\0' && strstr(val, w->value) != NULL;
+    case MS_WHEN_IN:       return w->value[0] != '\0' && inList(w->value, val);
     default:               return strcmp(val, w->value) == 0;
   }
 }
@@ -238,8 +242,13 @@ static void buildSpec(SMsSpec *spec, const SMsCfg *cfg, const SMsRule *rule) {
 }
 
 static int64_t toMilli(int64_t v, int32_t precision) {
+  /* Saturate instead of overflowing on attacker-controlled timestamps. */
+  if (precision == MS_TS_SECOND) {
+    if (v > INT64_MAX / 1000) return INT64_MAX;
+    if (v < INT64_MIN / 1000) return INT64_MIN;
+    return v * 1000;
+  }
   switch (precision) {
-    case MS_TS_SECOND: return v * 1000;
     case MS_TS_MILLI:  return v;
     case MS_TS_MICRO:  return v / 1000;
     case MS_TS_NANO:   return v / 1000000;
@@ -267,9 +276,11 @@ static int32_t renderTs(const SMsCtx *ctx, int64_t *ts, char *err, int32_t errLe
     return -1;
   }
   char *end = NULL;
+  errno = 0;
   long long raw = strtoll(v.text, &end, 10);
-  if (end == v.text) {
-    setErr(err, errLen, "timestamp field '%s' is not an integer: %s", spec->tsField, v.text);
+  if (end == v.text || *end != '\0' || errno == ERANGE) {
+    /* Do not echo the payload value into logs: it may contain secrets. */
+    setErr(err, errLen, "timestamp field '%s' is not a valid integer", spec->tsField);
     return -1;
   }
   *ts = toMilli((int64_t)raw, spec->tsPrecision);
@@ -291,26 +302,28 @@ static int32_t appendValue(SStr *line, const SMsColumn *col, const SMsValue *v,
   }
 
   if (type == MS_COL_NUMBER || type == MS_COL_INT) {
-    if (v->type == MSV_STRING) {
-      char *end = NULL;
-      strtod(v->text, &end);
-      if (end == v->text) {
-        setErr(err, errLen, "column '%s' expects a number, got '%s'", col->name, v->text);
-        return -1;
-      }
-    } else if (v->type != MSV_INT && v->type != MSV_DOUBLE) {
+    /* Never echo the raw text: a JSON string like "1,evil=2" would inject
+     * extra line-protocol fields. Parse strictly and re-format ourselves. */
+    if (v->type != MSV_STRING && v->type != MSV_INT && v->type != MSV_DOUBLE) {
       setErr(err, errLen, "column '%s' expects a number", col->name);
       return -1;
     }
+    char *end = NULL;
+    errno = 0;
     if (type == MS_COL_INT) {
-      if (strchr(v->text, '.') != NULL || strchr(v->text, 'e') != NULL ||
-          strchr(v->text, 'E') != NULL) {
-        setErr(err, errLen, "column '%s' expects an integer, got '%s'", col->name, v->text);
+      long long iv = strtoll(v->text, &end, 10);
+      if (end == v->text || *end != '\0' || errno == ERANGE) {
+        setErr(err, errLen, "column '%s' expects a 64-bit integer", col->name);
         return -1;
       }
-      return ssPrintf(line, "%si64", v->text);
+      return ssPrintf(line, "%lldi64", iv);
     }
-    return ssPrintf(line, "%s", v->text);
+    double d = strtod(v->text, &end);
+    if (end == v->text || *end != '\0' || errno == ERANGE || !isfinite(d)) {
+      setErr(err, errLen, "column '%s' expects a finite number", col->name);
+      return -1;
+    }
+    return ssPrintf(line, "%.17g", d);
   }
 
   if (type == MS_COL_BOOL) {
@@ -340,6 +353,7 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
   const SMsSpec *spec = ctx->spec;
   SStr line;
   char *pendingRaw = NULL;
+  int32_t pendingRawLen = 0;
   if (ssInit(&line, 1024) != 0) return -1;
 
   /* Resolve the timestamp first: {_year}/{_month}/{_day} in stable/table/tag
@@ -358,12 +372,28 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
     ctx->day = d;
   }
 
-  /* measurement */
-  if (msRender(spec->stable, lookup, ctx, &line) != 0) {
-    setErr(err, errLen, "cannot render stable template '%s'", spec->stable);
+  /* measurement: render into a scratch buffer and escape before appending.
+   * Rendering straight into `line` lets a topic-injected comma/space create
+   * extra tags or start the field set early. */
+  SStr stableName;
+  if (ssInit(&stableName, 128) != 0) {
     ssFree(&line);
     return -1;
   }
+  if (msRender(spec->stable, lookup, ctx, &stableName) != 0) {
+    setErr(err, errLen, "cannot render stable template '%s'", spec->stable);
+    ssFree(&stableName);
+    ssFree(&line);
+    return -1;
+  }
+  if (stableName.len == 0 || ssPutEscaped(&line, stableName.data, 1) != 0) {
+    setErr(err, errLen, "stable template '%s' rendered empty or exceeds buffer limit",
+           spec->stable);
+    ssFree(&stableName);
+    ssFree(&line);
+    return -1;
+  }
+  ssFree(&stableName);
 
   /* child table name, injected as a tag so tbnameKey can pick it up */
   SStr tableName;
@@ -417,14 +447,17 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
     const SMsColumn *c = &spec->columns[i];
     SMsValue v;
     char *raw = NULL;
+    int32_t rawLen = 0;
 
     if (strcmp(c->path, MS_PATH_PAYLOAD) == 0) {
       raw = tools_cJSON_PrintUnformatted(ctx->rec);
+      if (raw != NULL) rawLen = (int32_t)strlen(raw);
     } else if (strcmp(c->path, MS_PATH_MESSAGE) == 0) {
       raw = (char *)malloc((size_t)ctx->messageLen + 1);
       if (raw != NULL) {
         memcpy(raw, ctx->message, (size_t)ctx->messageLen);
         raw[ctx->messageLen] = '\0';
+        rawLen = ctx->messageLen;
       }
     } else if (msJsonPath(ctx->rec, c->path, &v) != 0 || v.type == MSV_NULL) {
       if (c->type != MS_COL_AUTO) {
@@ -436,6 +469,7 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
     if (strcmp(c->path, MS_PATH_PAYLOAD) == 0 || strcmp(c->path, MS_PATH_MESSAGE) == 0) {
       if (raw == NULL) goto fail;
       pendingRaw = raw;
+      pendingRawLen = rawLen;
     }
 
     int32_t mark = line.len;
@@ -443,9 +477,10 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
     if (ssPutEscaped(&line, c->name, 1) != 0 || ssPutChar(&line, '=') != 0) goto fail;
 
     if (pendingRaw != NULL) {
-      /* Escaping follows the line-protocol column-value rule: only " and \. */
+      /* Escaping follows the line-protocol column-value rule: only " and \.
+       * Length-aware so an embedded NUL cannot truncate the raw payload. */
       int32_t ok = (ssPutChar(&line, '"') == 0 &&
-                    ssPutEscaped(&line, pendingRaw, 2) == 0 &&
+                    ssPutEscapedN(&line, pendingRaw, pendingRawLen, 2) == 0 &&
                     ssPutChar(&line, '"') == 0);
       free(pendingRaw);
       pendingRaw = NULL;
@@ -472,6 +507,7 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
   if (ssPrintf(&line, " %lld", (long long)ctx->tsMs) != 0) goto fail;
 
   if (ssPut(out, line.data, line.len) != 0 || ssPutChar(out, '\0') != 0) {
+    setErr(err, errLen, "line protocol buffer limit (64MB) exceeded");
     ssFree(&line);
     return -1;
   }
@@ -498,6 +534,12 @@ int32_t msMapPayload(const SMsCfg *cfg, const char *payload, int32_t len,
     setErr(err, errLen, "empty payload");
     return -1;
   }
+  /* Templates resolve topic variables into MS_TEXT_LEN buffers. Mapping on a
+   * silently truncated topic could route rows to the wrong subtable. */
+  if (topic != NULL && strlen(topic) >= MS_TEXT_LEN) {
+    setErr(err, errLen, "topic exceeds %d bytes; refusing to map", MS_TEXT_LEN - 1);
+    return -1;
+  }
 
   char *text = (char *)malloc((size_t)len + 1);
   if (text == NULL) return -1;
@@ -513,6 +555,7 @@ int32_t msMapPayload(const SMsCfg *cfg, const char *payload, int32_t len,
 
   SStr buf;
   if (ssInit(&buf, 4096) != 0) {
+    setErr(err, errLen, "out of memory mapping payload");
     tools_cJSON_Delete(root);
     return -1;
   }
@@ -553,7 +596,12 @@ int32_t msMapPayload(const SMsCfg *cfg, const char *payload, int32_t len,
     return -1;
   }
   *out = ssDetach(&buf);
-  if (*out == NULL) return -1;
+  if (*out == NULL) {
+    if (err != NULL && errLen > 0 && err[0] == '\0') {
+      setErr(err, errLen, "line protocol buffer limit (64MB) exceeded");
+    }
+    return -1;
+  }
   *outNum = ok;
   return 0;
 }

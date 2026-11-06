@@ -170,6 +170,9 @@ void startTrace() {
   Dwarf_Ptr errarg = 0;
 
   FILE *fp = fopen("/proc/self/maps", "r");
+  if (fp == NULL) {
+    return; /* /proc may be unavailable (sandbox, non-Linux, hardening) */
+  }
   ret = fscanf(fp, "%lx-", &addr);
   fclose(fp);
 
@@ -297,8 +300,15 @@ void *taosMemMalloc(int64_t size) {
 
 void *taosMemCalloc(int64_t num, int64_t size) {
 #ifdef USE_TD_MEMORY
-  int32_t memorySize = num * size;
-  char   *tmp = calloc(memorySize + sizeof(TdMemoryInfo), 1);
+  /* The header stores the size in an int32_t and is appended to the payload;
+   * reject anything that would overflow either the product or the field. */
+  const int64_t limit = (int64_t)INT32_MAX - (int64_t)sizeof(TdMemoryInfo);
+  if (num < 0 || size < 0 || (size > 0 && num > limit / size)) {
+    terrno = TSDB_CODE_OUT_OF_MEMORY;
+    return NULL;
+  }
+  int32_t memorySize = (int32_t)(num * size);
+  char   *tmp = calloc((size_t)(memorySize + (int32_t)sizeof(TdMemoryInfo)), 1);
   if (tmp == NULL) {
     terrno = TSDB_CODE_OUT_OF_MEMORY;
     return NULL;
@@ -337,7 +347,7 @@ void *taosMemRealloc(void *ptr, int64_t size) {
   if (ptr == NULL) return taosMemoryMalloc(size);
 
   TdMemoryInfoPtr pTdMemoryInfo = (TdMemoryInfoPtr)((char *)ptr - sizeof(TdMemoryInfo));
-  if (tpTdMemoryInfo->symbol != TD_MEMORY_SYMBOL) {
+  if (pTdMemoryInfo->symbol != TD_MEMORY_SYMBOL) {
     terrno = TSDB_CODE_OUT_OF_MEMORY;
     return NULL;
   }
@@ -345,7 +355,11 @@ void *taosMemRealloc(void *ptr, int64_t size) {
   TdMemoryInfo tdMemoryInfo;
   memcpy(&tdMemoryInfo, pTdMemoryInfo, sizeof(TdMemoryInfo));
 
-  void *tmp = realloc(pTdMemoryInfo, size + sizeof(TdMemoryInfo));
+  if (size < 0 || size > (int64_t)INT32_MAX - (int64_t)sizeof(TdMemoryInfo)) {
+    terrno = TSDB_CODE_OUT_OF_MEMORY;
+    return NULL;
+  }
+  void *tmp = realloc(pTdMemoryInfo, (size_t)(size + sizeof(TdMemoryInfo)));
   if (tmp == NULL) {
     terrno = TSDB_CODE_OUT_OF_MEMORY;
     return NULL;

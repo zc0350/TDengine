@@ -122,16 +122,20 @@ def main():
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, bufsize=1)
     conn = None
+    stdout, stderr = "", ""
+    failure = None
     try:
         conn, _ = srv.accept()
         conn.settimeout(10)
 
         header, _ = read_packet(conn)
-        assert header == 0x10, "expected CONNECT, got 0x%02x" % header
+        if header != 0x10:
+            raise RuntimeError("expected CONNECT, got 0x%02x" % header)
         conn.sendall(b"\x20\x02\x00\x00")  # CONNACK, accepted
 
         header, body = read_packet(conn)
-        assert header == 0x82, "expected SUBSCRIBE, got 0x%02x" % header
+        if header != 0x82:
+            raise RuntimeError("expected SUBSCRIBE, got 0x%02x" % header)
         sub_id = body[:2]
         conn.sendall(b"\x90\x03" + sub_id + b"\x01")  # SUBACK, granted QoS 1
 
@@ -144,7 +148,13 @@ def main():
 
         time.sleep(1.0)
         proc.terminate()
-        stdout, stderr = proc.communicate(timeout=10)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=10)
+    except Exception as exc:  # report the root cause, not an UnboundLocalError
+        failure = "%s: %s" % (type(exc).__name__, exc)
     finally:
         if conn is not None:
             conn.close()
@@ -155,6 +165,14 @@ def main():
             pass
         if proc.poll() is None:
             proc.kill()
+
+    if failure:
+        print("FAIL:", failure)
+        print("--- stdout ---")
+        print(stdout)
+        print("--- stderr ---")
+        print(stderr)
+        return 1
 
     lines = [x.strip() for x in stdout.splitlines() if x.strip()]
     year = str(datetime.datetime.now().year)

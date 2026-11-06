@@ -12,6 +12,13 @@
 
 #include "mqttsrc.h"
 
+#ifndef MS_TEST_EXAMPLE_CONFIG
+#define MS_TEST_EXAMPLE_CONFIG "mqttsrc.example.json"
+#endif
+#ifndef MS_TEST_RULES_CONFIG
+#define MS_TEST_RULES_CONFIG "mqttsrc.rules.example.json"
+#endif
+
 static int gFail = 0;
 static int gPass = 0;
 
@@ -22,6 +29,7 @@ static int gPass = 0;
     } else {                                                \
       ++gFail;                                               \
       fprintf(stderr, "FAIL line %d: %s\n", __LINE__, msg); \
+      return;                                                \
     }                                                       \
   } while (0)
 
@@ -33,6 +41,7 @@ static int gPass = 0;
       ++gFail;                                                               \
       fprintf(stderr, "FAIL line %d:\n  got : %s\n  want: %s\n", __LINE__, \
               (a), (b));                                                    \
+      return;                                                               \
     }                                                                       \
   } while (0)
 
@@ -158,6 +167,27 @@ static void testMapping(const SMsCfg *cfg) {
   rc = msMapPayload(cfg, "{not json", 9, "factory/bj/telemetry", 0,
                     &out, &num, err, sizeof(err));
   CHECK(rc == -1 && out == NULL, "invalid JSON must be rejected");
+
+  /* Regression: a JSON string in a numeric column must not inject extra
+   * line-protocol fields such as "1,evil=2". */
+  const char *inject =
+      "{\"ts\":1730000000000,\"dev\":\"d1\",\"current\":\"1,evil=2\","
+      "\"voltage\":220,\"running\":true,\"note\":\"x\"}";
+  out = NULL;
+  num = 0;
+  rc = msMapPayload(cfg, inject, (int32_t)strlen(inject), "factory/bj/telemetry",
+                    1730000000000LL, &out, &num, err, sizeof(err));
+  CHECK(rc == -1 && out == NULL, "numeric string with injected field is rejected");
+
+  /* Regression: an over-long topic is rejected, not silently truncated. */
+  char longTopic[MS_TEXT_LEN + 8];
+  memset(longTopic, 'a', sizeof(longTopic) - 1);
+  longTopic[sizeof(longTopic) - 1] = '\0';
+  out = NULL;
+  num = 0;
+  rc = msMapPayload(cfg, payload, (int32_t)strlen(payload), longTopic,
+                    1730000000000LL, &out, &num, err, sizeof(err));
+  CHECK(rc == -1 && out == NULL, "over-long topic is rejected");
 }
 
 static void testTimestamp(const SMsCfg *base) {
@@ -326,6 +356,18 @@ static void testRules(const char *path) {
   snprintf(badKey.mapping.rules[0].tbnameKey, MS_NAME_LEN, "%s", "other");
   CHECK(msValidateConfig(&badKey, err, sizeof(err)) == -1,
         "per-rule tbname_key override rejected");
+
+  /* Regression: a topic-controlled measurement must escape line-protocol
+   * separators, otherwise a publisher can inject extra tags/fields. */
+  const char *evilTopic = "factory/x,injected=1/telemetry";
+  out = NULL;
+  num = 0;
+  rc = msMapPayload(&cfg, temp, (int32_t)strlen(temp), evilTopic, 0,
+                    &out, &num, err, sizeof(err));
+  CHECK(rc == 0 && out != NULL &&
+        strstr(out, "sensor_x\\,injected\\=1,") != NULL,
+        "measurement escapes topic-injected separators");
+  free(out);
 }
 
 static void testRawColumns(void) {
@@ -385,8 +427,8 @@ static void testRawColumns(void) {
 }
 
 int main(int argc, char **argv) {
-  const char *path = (argc > 1) ? argv[1] : "mqttsrc.example.json";
-  const char *rulesPath = (argc > 2) ? argv[2] : "mqttsrc.rules.example.json";
+  const char *path = (argc > 1) ? argv[1] : MS_TEST_EXAMPLE_CONFIG;
+  const char *rulesPath = (argc > 2) ? argv[2] : MS_TEST_RULES_CONFIG;
   testVarint();
   testConfig(path);
   SMsCfg cfg;

@@ -788,6 +788,9 @@ function install_header() {
   [ -f ${inc_link_dir}/taosws.h ] && ${csudo}rm -f ${inc_link_dir}/taosws.h ||:
   ${csudo}cp -f ${source_dir}/include/client/taos.h ${source_dir}/include/common/taosdef.h ${source_dir}/include/util/taoserror.h ${source_dir}/include/util/tdef.h ${source_dir}/include/libs/function/taosudf.h \
     ${install_main_dir}/include && ${csudo}chmod 644 ${install_main_dir}/include/*
+  if [ -f "${source_dir}/include/libs/mqttsrc/mqttsrc.h" ]; then
+    ${csudo}cp -f "${source_dir}/include/libs/mqttsrc/mqttsrc.h" ${install_main_dir}/include/ || :
+  fi
 
   if [ -f "${ws_header_file}" ]; then
     ${csudo}cp -f "${ws_header_file}" ${install_main_dir}/include && ${csudo}chmod 644 ${install_main_dir}/include/taosws.h ||:
@@ -894,6 +897,15 @@ function install_connector() {
 
 function install_examples() {
   ${csudo}cp -rf ${source_dir}/examples/* ${install_main_dir}/examples || :
+
+  # mqttsrc sample configs live with the module, not in docs/examples.
+  local ms_conf="${source_dir}/source/libs/mqttsrc/conf"
+  if [ -d "${ms_conf}" ]; then
+    ${csudo}mkdir -p ${install_main_dir}/examples/mqttsrc || :
+    for f in "${ms_conf}"/*.example.json; do
+      [ -f "$f" ] && ${csudo}cp -f "$f" ${install_main_dir}/examples/mqttsrc/ || :
+    done
+  fi
 }
 
 function clean_service_on_sysvinit() {

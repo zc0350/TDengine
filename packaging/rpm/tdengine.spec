@@ -119,6 +119,7 @@ cp %{_compiledir}/build/bin/taosudf                 %{buildroot}%{homepath}/bin
 cp %{_compiledir}/build/bin/taosBenchmark           %{buildroot}%{homepath}/bin
 cp %{_compiledir}/build/bin/taosdump                %{buildroot}%{homepath}/bin
 cp %{_compiledir}/build/bin/taosmqtt                %{buildroot}%{homepath}/bin
+cp %{_compiledir}/build/bin/taosmqttsrc             %{buildroot}%{homepath}/bin
 cp %{_compiledir}/build/bin/taosgen                 %{buildroot}%{homepath}/bin
 
 cp %{_internalpackagingdir}/start-all.sh  %{buildroot}%{homepath}/bin
@@ -154,6 +155,7 @@ cp %{_communitysourcedir}/include/common/taosdef.h       %{buildroot}%{homepath}
 cp %{_communitysourcedir}/include/util/taoserror.h       %{buildroot}%{homepath}/include
 cp %{_communitysourcedir}/include/util/tdef.h            %{buildroot}%{homepath}/include
 cp %{_communitysourcedir}/include/libs/function/taosudf.h       %{buildroot}%{homepath}/include
+cp %{_communitysourcedir}/include/libs/mqttsrc/mqttsrc.h          %{buildroot}%{homepath}/include
 [ -f %{_compiledir}/build/include/taosws.h ] && cp %{_compiledir}/build/include/taosws.h            %{buildroot}%{homepath}/include ||:
 #cp -r %{_compiledir}/../src/connector/python        %{buildroot}%{homepath}/connector
 #cp -r %{_compiledir}/../src/connector/go            %{buildroot}%{homepath}/connector
@@ -179,6 +181,11 @@ while read -r ex_group ex_dst ex_src; do
     mkdir -p %{buildroot}%{homepath}/examples/${ex_dst}/$(dirname "${ex_rel}")
     cp "${_examples_dir}/${ex_src}" %{buildroot}%{homepath}/examples/${ex_dst}/${ex_rel}
 done < "${_examples_manifest}"
+
+# MQTT data source sample configs (not part of docs/examples).
+mkdir -p %{buildroot}%{homepath}/examples/mqttsrc
+cp %{_communitysourcedir}/source/libs/mqttsrc/conf/*.example.json \
+   %{buildroot}%{homepath}/examples/mqttsrc/
 
 if [ -f %{_compiledir}/build/bin/jemalloc-config ]; then
     mkdir -p %{buildroot}%{homepath}/jemalloc/ ||:
@@ -300,6 +307,7 @@ if [ $1 -eq 0 ];then
     ${csudo}rm -f ${bin_link_dir}/taosdump       || :
     ${csudo}rm -f ${bin_link_dir}/taosBenchmark       || :
     ${csudo}rm -f ${bin_link_dir}/taosmqtt    || :
+    ${csudo}rm -f ${bin_link_dir}/taosmqttsrc || :
     ${csudo}rm -f ${bin_link_dir}/taosgen    || :
     ${csudo}rm -f ${cfg_link_dir}/*          || :
     ${csudo}rm -f ${inc_link_dir}/taos.h     || :

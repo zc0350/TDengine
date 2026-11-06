@@ -11,4 +11,8 @@ IF(CMAKE_SYSTEM_NAME MATCHES "Windows")
         SET(BUILD_TYPE "")
     ENDIF ()
 ENDIF()
-ADD_SUBDIRECTORY(toolscJson)
+# source/libs/mqttsrc may have already defined this target (source/ is added
+# before tools/ by the top-level CMakeLists).
+IF (NOT TARGET toolscJson)
+    ADD_SUBDIRECTORY(toolscJson)
+ENDIF()

@@ -9,6 +9,8 @@
 #include "toolscJson.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <time.h>
@@ -138,23 +140,29 @@ int32_t ssPrintf(SStr *s, const char *fmt, ...) {
   return ssPut(s, tmp, n);
 }
 
-int32_t ssPutEscaped(SStr *s, const char *p, int32_t mode) {
-  if (p == NULL) return 0;
-  for (const unsigned char *c = (const unsigned char *)p; *c; ++c) {
-    bool esc = false;
-    if (mode == 1) {
-      esc = (*c == ' ' || *c == ',' || *c == '=' || *c == '"' || *c == '\\');
-    } else {
-      esc = (*c == '"' || *c == '\\');
-    }
-    if (esc && ssPutChar(s, '\\') != 0) return -1;
-    if (*c == '\n' || *c == '\r' || *c == '\t') {
+/* Length-aware escaping. Control bytes (including an embedded NUL) are
+ * replaced by spaces: a NUL would otherwise truncate the value, and raw
+ * newlines/tabs would break the line-protocol framing. */
+int32_t ssPutEscapedN(SStr *s, const char *p, int32_t n, int32_t mode) {
+  if (p == NULL || n <= 0) return 0;
+  for (int32_t i = 0; i < n; ++i) {
+    unsigned char c = (unsigned char)p[i];
+    if (c < 0x20 || c == 0x7f) {
       if (ssPutChar(s, ' ') != 0) return -1;
-    } else if (ssPutChar(s, (char)*c) != 0) {
-      return -1;
+      continue;
     }
+    bool esc = (mode == 1)
+                   ? (c == ' ' || c == ',' || c == '=' || c == '"' || c == '\\')
+                   : (c == '"' || c == '\\');
+    if (esc && ssPutChar(s, '\\') != 0) return -1;
+    if (ssPutChar(s, (char)c) != 0) return -1;
   }
   return 0;
+}
+
+int32_t ssPutEscaped(SStr *s, const char *p, int32_t mode) {
+  if (p == NULL) return 0;
+  return ssPutEscapedN(s, p, (int32_t)strlen(p), mode);
 }
 
 char *ssDetach(SStr *s) {
@@ -264,8 +272,11 @@ int32_t msJsonPath(tools_cJSON *root, const char *path, SMsValue *val) {
 int32_t msStrToInt(const char *p, int32_t def) {
   if (p == NULL || *p == '\0') return def;
   char *end = NULL;
+  errno = 0;
   long v = strtol(p, &end, 10);
-  if (end == p) return def;
+  if (end == p || *end != '\0' || errno == ERANGE || v < INT32_MIN || v > INT32_MAX) {
+    return def;
+  }
   return (int32_t)v;
 }
 
@@ -274,6 +285,12 @@ void msStrCopy(char *dst, int32_t cap, const char *src) {
   if (src == NULL) {
     dst[0] = '\0';
     return;
+  }
+  /* jstr() returns the default value, which is often dst itself. snprintf()
+   * with overlapping source/destination is undefined behaviour. */
+  if (src == dst) return;
+  if (strlen(src) >= (size_t)cap) {
+    msLog(MS_LOG_WARN, "config string truncated to %d bytes", cap - 1);
   }
   snprintf(dst, (size_t)cap, "%s", src);
 }

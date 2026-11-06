@@ -6,7 +6,7 @@
     {"event": "alarms", "deviceCode": "TT10002", "door_num": [1], "code": 1, "time": 1793936103}
   ],
   "expected": [
-    "device_events_2026,device=TT10002,year=2026,tbname=t_TT10002 event=\"status\",device_code=\"TT10002\",imei=\"864925080140265\",data=\"{\\\"event\\\":\\\"status\\\",\\\"deviceCode\\\":\\\"TT10002\\\",\\\"imei\\\":\\\"864925080140265\\\",\\\"sigal\\\":25,\\\"door_status\\\":0,\\\"server_id\\\":1,\\\"version\\\":\\\"mini_esp32_127\\\",\\\"cam\\\":\\\"ready\\\",\\\"sd\\\":\\\"ready\\\",\\\"time\\\":1793936202}\" 1793936202000",
-    "device_events_2026,device=TT10002,year=2026,tbname=t_TT10002 event=\"alarms\",device_code=\"TT10002\",data=\"{\\\"event\\\":\\\"alarms\\\",\\\"deviceCode\\\":\\\"TT10002\\\",\\\"door_num\\\":[1],\\\"code\\\":1,\\\"time\\\":1793936103}\" 1793936103000"
+    "device_events_{server_year},device=TT10002,year={server_year},tbname=t_TT10002 event=\"status\",device_code=\"TT10002\",imei=\"864925080140265\",data=\"{\\\"event\\\":\\\"status\\\",\\\"deviceCode\\\":\\\"TT10002\\\",\\\"imei\\\":\\\"864925080140265\\\",\\\"sigal\\\":25,\\\"door_status\\\":0,\\\"server_id\\\":1,\\\"version\\\":\\\"mini_esp32_127\\\",\\\"cam\\\":\\\"ready\\\",\\\"sd\\\":\\\"ready\\\",\\\"time\\\":1793936202}\" 1793936202000",
+    "device_events_{server_year},device=TT10002,year={server_year},tbname=t_TT10002 event=\"alarms\",device_code=\"TT10002\",data=\"{\\\"event\\\":\\\"alarms\\\",\\\"deviceCode\\\":\\\"TT10002\\\",\\\"door_num\\\":[1],\\\"code\\\":1,\\\"time\\\":1793936103}\" 1793936103000"
   ]
 }

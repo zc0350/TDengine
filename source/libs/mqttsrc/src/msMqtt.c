@@ -38,14 +38,22 @@ typedef int MsFd;
 #define MS_MQTT_DISCONNECT  14
 
 typedef struct {
-  MsFd    fd;
-  SStr    rx;
-  int64_t lastSendMs;
-  int64_t lastRecvMs;
-  uint16_t nextId;
-  uint16_t qos2Seen[256];
-  int32_t  qos2Pos;
+  MsFd              fd;
+  SStr              rx;
+  int64_t           lastSendMs;
+  int64_t           lastRecvMs;
+  uint16_t          nextId;
+  uint16_t          qos2Seen[256];
+  int32_t           qos2Pos;
+  volatile int32_t *stop;
+  uint16_t          pendingSubId;
+  int32_t           subAckResult; /* -2 pending, 0 accepted, -1 rejected */
 } SMsConn;
+
+#define MS_SUBACK_PENDING (-2)
+#define MS_SEND_TIMEOUT_MS 5000
+
+static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts);
 
 static void rxConsume(SStr *b, int32_t n) {
   if (n >= b->len) {
@@ -110,9 +118,17 @@ static int32_t buildPacket(SStr *out, uint8_t typeFlags, const char *body, int32
   return bodyLen > 0 ? ssPut(out, body, bodyLen) : 0;
 }
 
-static int32_t sendAll(MsFd fd, const char *p, int32_t len) {
+/* Bounded, stop-aware send. EINTR/EAGAIN used to spin forever with no way to
+ * honour a stop request; now we wait for writability with a short timeout. */
+static int32_t sendAll(MsFd fd, const char *p, int32_t len, volatile int32_t *stop) {
   int32_t sent = 0;
+  int64_t deadline = msNowMs() + MS_SEND_TIMEOUT_MS;
   while (sent < len) {
+    if (stop != NULL && MS_STOPPED(stop)) return -1;
+    if (msNowMs() >= deadline) {
+      msLog(MS_LOG_WARN, "send timed out after %d byte(s)", sent);
+      return -1;
+    }
 #ifdef _WIN32
     int n = send(fd, p + sent, len - sent, 0);
 #else
@@ -123,11 +139,26 @@ static int32_t sendAll(MsFd fd, const char *p, int32_t len) {
       continue;
     }
 #ifdef _WIN32
-    if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+    if (n != SOCKET_ERROR) return -1;
+    int err = WSAGetLastError();
+    if (err != WSAEWOULDBLOCK && err != WSAEINTR) return -1;
 #else
-    if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+    if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
 #endif
-    return -1;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    int64_t left = deadline - msNowMs();
+    if (left <= 0) return -1;
+    if (left > 100) left = 100; /* keep stop responsive */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = (long)(left * 1000);
+    int sel = select((int)fd + 1, NULL, &wfds, NULL, &tv);
+#ifndef _WIN32
+    if (sel < 0 && errno == EINTR) continue;
+#endif
+    if (sel < 0) return -1;
   }
   return 0;
 }
@@ -139,7 +170,7 @@ static int32_t sendPacket(SMsConn *c, uint8_t typeFlags, const char *body, int32
     ssFree(&pkt);
     return -1;
   }
-  int32_t rc = sendAll(c->fd, pkt.data, pkt.len);
+  int32_t rc = sendAll(c->fd, pkt.data, pkt.len, c->stop);
   ssFree(&pkt);
   if (rc == 0) c->lastSendMs = msNowMs();
   return rc;
@@ -260,13 +291,31 @@ static uint16_t nextId(SMsConn *c) {
   return c->nextId;
 }
 
-static bool qos2Duplicate(SMsConn *c, uint16_t id) {
+/* QoS2 de-duplication state is only committed after the message has been
+ * persisted, is cleared on PUBREL, and is reset on every reconnect. */
+static bool qos2Seen(SMsConn *c, uint16_t id) {
+  if (id == 0) return false;
   for (int32_t i = 0; i < 256; ++i) {
-    if (c->qos2Seen[i] == id && id != 0) return true;
+    if (c->qos2Seen[i] == id) return true;
   }
+  return false;
+}
+
+static void qos2Remember(SMsConn *c, uint16_t id) {
+  if (id == 0) return;
   c->qos2Seen[c->qos2Pos] = id;
   c->qos2Pos = (c->qos2Pos + 1) % 256;
-  return false;
+}
+
+static void qos2Forget(SMsConn *c, uint16_t id) {
+  for (int32_t i = 0; i < 256; ++i) {
+    if (c->qos2Seen[i] == id) c->qos2Seen[i] = 0;
+  }
+}
+
+static void qos2Reset(SMsConn *c) {
+  memset(c->qos2Seen, 0, sizeof(c->qos2Seen));
+  c->qos2Pos = 0;
 }
 
 static int32_t mqttConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
@@ -299,12 +348,18 @@ static int32_t mqttConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
     tv.tv_sec = 0;
     tv.tv_usec = 100000;
     int sel = select((int)c->fd + 1, &rfds, NULL, NULL, &tv);
+#ifndef _WIN32
+    if (sel < 0 && errno == EINTR) continue;
+#endif
     if (sel < 0) return -1;
     if (sel == 0) continue;
 #ifdef _WIN32
     int n = recv(c->fd, buf, (int)sizeof(buf), 0);
 #else
     int n = (int)recv(c->fd, buf, sizeof(buf), 0);
+#endif
+#ifndef _WIN32
+    if (n < 0 && errno == EINTR) continue;
 #endif
     if (n <= 0) return -1;
     if (ssPut(&c->rx, buf, n) != 0) return -1;
@@ -338,48 +393,139 @@ static int32_t mqttSubscribe(SMsConn *c, const SMsBrokerCfg *cfg) {
     ok = (putStr(&body, cfg->topics[i].filter) == 0 &&
           ssPutChar(&body, (char)cfg->topics[i].qos) == 0);
   }
+  c->pendingSubId = id;
+  c->subAckResult = MS_SUBACK_PENDING;
   if (!ok || sendPacket(c, (uint8_t)((MS_MQTT_SUBSCRIBE << 4) | 0x02), body.data, body.len) != 0) {
     ssFree(&body);
     return -1;
   }
   ssFree(&body);
-  msLog(MS_LOG_INFO, "subscribed to %d topic filter(s), packetId=%u", cfg->topicNum, id);
+  msLog(MS_LOG_INFO, "SUBSCRIBE sent for %d topic filter(s), packetId=%u",
+        cfg->topicNum, id);
   return 0;
+}
+
+/* SUBACK carries the packet id followed by one granted-QoS byte per filter.
+ * 0x80 means the broker rejected that filter; previously this was silently
+ * ignored, so a rejected subscription looked like a healthy connection. */
+static int32_t handleSubAck(SMsConn *c, const uint8_t *body, int32_t bodyLen) {
+  if (c->pendingSubId == 0 || c->subAckResult != MS_SUBACK_PENDING) return 0;
+  if (bodyLen < 3) {
+    msLog(MS_LOG_ERROR, "malformed SUBACK (len=%d)", bodyLen);
+    return -1;
+  }
+  uint16_t id = (uint16_t)((body[0] << 8) | body[1]);
+  if (id != c->pendingSubId) return 0; /* stale SUBACK for an earlier attempt */
+  int32_t granted = bodyLen - 2;
+  for (int32_t i = 0; i < granted; ++i) {
+    if (body[2 + i] == 0x80) {
+      msLog(MS_LOG_ERROR, "broker rejected topic filter %d (packetId=%u)", i,
+            (unsigned)id);
+      c->subAckResult = -1;
+      c->pendingSubId = 0;
+      return -1;
+    }
+  }
+  c->subAckResult = 0;
+  c->pendingSubId = 0;
+  msLog(MS_LOG_INFO, "SUBACK accepted %d topic filter(s), packetId=%u", granted,
+        (unsigned)id);
+  return 0;
+}
+
+/* Wait for the SUBACK before entering the receive loop. Packets that arrive
+ * in the meantime are still processed, so no broker data is lost. */
+static int32_t waitSubAck(SMsConn *c, const SMsMqttOpts *opts) {
+  int64_t timeout = opts->cfg->connectTimeoutMs > 0 ? opts->cfg->connectTimeoutMs : 5000;
+  int64_t deadline = msNowMs() + timeout;
+  while (!MS_STOPPED(opts->stop) && msNowMs() < deadline) {
+    if (c->subAckResult != MS_SUBACK_PENDING) return c->subAckResult;
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(c->fd, &rfds);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    int sel = select((int)c->fd + 1, &rfds, NULL, NULL, &tv);
+#ifndef _WIN32
+    if (sel < 0 && errno == EINTR) continue;
+#endif
+    if (sel < 0) return -1;
+    if (sel == 0) continue;
+
+    char buf[8192];
+#ifdef _WIN32
+    int n = recv(c->fd, buf, (int)sizeof(buf), 0);
+#else
+    int n = (int)recv(c->fd, buf, sizeof(buf), 0);
+#endif
+#ifndef _WIN32
+    if (n < 0 && errno == EINTR) continue;
+#endif
+    if (n <= 0) return -1;
+    if (ssPut(&c->rx, buf, n) != 0 || processPackets(c, opts) != 0) return -1;
+  }
+  if (c->subAckResult == MS_SUBACK_PENDING) {
+    msLog(MS_LOG_ERROR, "timed out waiting for SUBACK (%lldms)", (long long)timeout);
+    return -1;
+  }
+  return c->subAckResult;
 }
 
 static int32_t handlePublish(SMsConn *c, const SMsMqttOpts *opts, uint8_t flags,
                              const uint8_t *body, int32_t bodyLen) {
   if (bodyLen < 2) return -1;
   int32_t topicLen = (body[0] << 8) | body[1];
-  if (topicLen < 0 || 2 + topicLen > bodyLen) return -1;
-  char topic[MS_TEXT_LEN];
-  int32_t n = topicLen < (int32_t)sizeof(topic) - 1 ? topicLen : (int32_t)sizeof(topic) - 1;
-  memcpy(topic, body + 2, (size_t)n);
-  topic[n] = '\0';
+  if (topicLen < 0 || topicLen > 65535 || 2 + topicLen > bodyLen) return -1;
+  /* Allocate the full topic: MQTT allows 65535 bytes and a 255-byte stack
+   * buffer used to truncate it, corrupting topic variables and routing. */
+  char *topic = (char *)malloc((size_t)topicLen + 1);
+  if (topic == NULL) return -1;
+  memcpy(topic, body + 2, (size_t)topicLen);
+  topic[topicLen] = '\0';
 
   int32_t pos = 2 + topicLen;
   int32_t qos = (flags >> 1) & 0x03;
+  if (qos == 3) { /* reserved by MQTT 3.1.1 */
+    free(topic);
+    return -1;
+  }
   uint16_t packetId = 0;
   if (qos > 0) {
-    if (pos + 2 > bodyLen) return -1;
+    if (pos + 2 > bodyLen) {
+      free(topic);
+      return -1;
+    }
     packetId = (uint16_t)((body[pos] << 8) | body[pos + 1]);
     pos += 2;
   }
 
-  bool dup = (qos == 2) ? qos2Duplicate(c, packetId) : false;
+  bool dup = (qos == 2) ? qos2Seen(c, packetId) : false;
+  int32_t delivered = 0;
   if (!dup && opts->onMessage != NULL) {
-    opts->onMessage(opts->arg, topic, body + pos, bodyLen - pos, qos, packetId);
+    delivered = opts->onMessage(opts->arg, topic, body + pos, bodyLen - pos, qos,
+                                packetId);
   }
+  if (delivered != 0) {
+    /* No ACK: force a reconnect so the broker redelivers this PUBLISH. */
+    msLog(MS_LOG_WARN, "message not persisted, withholding QoS ACK (packetId=%u)",
+          (unsigned)packetId);
+    free(topic);
+    return -1;
+  }
+  if (qos == 2) qos2Remember(c, packetId);
 
+  int32_t rc = 0;
   if (qos == 1) {
     char ack[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
-    return sendPacket(c, (uint8_t)(MS_MQTT_PUBACK << 4), ack, 2);
-  }
-  if (qos == 2) {
+    rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBACK << 4), ack, 2);
+  } else if (qos == 2) {
     char rec[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
-    return sendPacket(c, (uint8_t)(MS_MQTT_PUBREC << 4), rec, 2);
+    rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBREC << 4), rec, 2);
   }
-  return 0;
+  free(topic);
+  return rc;
 }
 
 static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts) {
@@ -405,13 +551,17 @@ static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts) {
         break;
       case MS_MQTT_PUBREL: {
         if (rem >= 2) {
+          uint16_t id = (uint16_t)(((uint8_t)body[0] << 8) | (uint8_t)body[1]);
+          qos2Forget(c, id); /* QoS2 handshake complete: release the id */
           char comp[2] = {(char)body[0], (char)body[1]};
           rc2 = sendPacket(c, (uint8_t)(MS_MQTT_PUBCOMP << 4), comp, 2);
         }
         break;
       }
-      case MS_MQTT_PINGRESP:
       case MS_MQTT_SUBACK:
+        rc2 = handleSubAck(c, body, (int32_t)rem);
+        break;
+      case MS_MQTT_PINGRESP:
       case MS_MQTT_PUBACK:
       case MS_MQTT_PUBREC:
       case MS_MQTT_PUBCOMP:
@@ -432,7 +582,7 @@ static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts) {
 
 static void sleepInterruptible(int32_t ms, volatile int32_t *stop) {
   int64_t deadline = msNowMs() + ms;
-  while (!*stop && msNowMs() < deadline) msSleepMs(100);
+  while (!MS_STOPPED(stop) && msNowMs() < deadline) msSleepMs(100);
 }
 
 int32_t msMqttLoop(const SMsMqttOpts *opts) {
@@ -450,32 +600,53 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
   SMsConn conn;
   memset(&conn, 0, sizeof(conn));
   conn.fd = MS_BADFD;
-  if (ssInit(&conn.rx, 8192) != 0) return -1;
+  conn.stop = opts->stop;
   conn.nextId = 1;
-
-  int32_t backoff = cfg->reconnectMs;
+  conn.subAckResult = MS_SUBACK_PENDING;
   int32_t final = 0;
+  int32_t backoff = cfg->reconnectMs;
 
-  while (!*opts->stop) {
+  if (ssInit(&conn.rx, 8192) != 0) {
+    msLog(MS_LOG_ERROR, "cannot allocate MQTT rx buffer");
+    final = -1;
+    goto done;
+  }
+
+  while (!MS_STOPPED(opts->stop)) {
+    /* A fresh session invalidates QoS2 de-dup state, packet ids and any
+     * pending SUBACK. Old state used to misclassify redelivered messages. */
+    qos2Reset(&conn);
+    conn.nextId = 1;
+    conn.pendingSubId = 0;
+    conn.subAckResult = MS_SUBACK_PENDING;
+
     if (netConnect(&conn, cfg) != 0 || mqttConnect(&conn, cfg) != 0 ||
-        mqttSubscribe(&conn, cfg) != 0) {
+        mqttSubscribe(&conn, cfg) != 0 || waitSubAck(&conn, opts) != 0) {
       msLog(MS_LOG_WARN, "MQTT connect/subscribe failed, retry in %dms", backoff);
       closeConn(&conn);
       if (opts->reconnects != NULL) ++(*opts->reconnects);
       sleepInterruptible(backoff, opts->stop);
-      backoff = backoff * 2 > cfg->maxReconnectMs ? cfg->maxReconnectMs : backoff * 2;
+      int64_t next = (int64_t)backoff * 2;
+      backoff = (int32_t)(next > cfg->maxReconnectMs ? cfg->maxReconnectMs : next);
       continue;
     }
     backoff = cfg->reconnectMs;
     msLog(MS_LOG_INFO, "MQTT connected to %s:%u, clientId=%s", cfg->host,
           (unsigned)cfg->port, cfg->clientId);
 
-    while (!*opts->stop) {
+    while (!MS_STOPPED(opts->stop)) {
       if (opts->onTick != NULL) opts->onTick(opts->arg);
 
-      int64_t idle = msNowMs() - conn.lastSendMs;
-      if (idle > (int64_t)cfg->keepalive * 800) {
+      int64_t now = msNowMs();
+      if (now - conn.lastSendMs > (int64_t)cfg->keepalive * 800) {
         if (sendPacket(&conn, (uint8_t)(MS_MQTT_PINGREQ << 4), NULL, 0) != 0) break;
+      }
+      /* Half-open detection: select() keeps timing out on a dead peer and
+       * PINGRESP never arrives. Without this check the loop never reconnects. */
+      if (now - conn.lastRecvMs > (int64_t)cfg->keepalive * 1500) {
+        msLog(MS_LOG_WARN, "no data from broker for %lldms, reconnecting",
+              (long long)(now - conn.lastRecvMs));
+        break;
       }
 
       fd_set rfds;
@@ -485,6 +656,9 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
       tv.tv_sec = 0;
       tv.tv_usec = 100000; /* 100ms keeps batch flush and stop responsive */
       int sel = select((int)conn.fd + 1, &rfds, NULL, NULL, &tv);
+#ifndef _WIN32
+      if (sel < 0 && errno == EINTR) continue;
+#endif
       if (sel < 0) break;
       if (sel > 0) {
         char buf[8192];
@@ -493,25 +667,28 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
 #else
         int n = (int)recv(conn.fd, buf, sizeof(buf), 0);
 #endif
+#ifndef _WIN32
+        if (n < 0 && errno == EINTR) continue;
+#endif
         if (n <= 0) break;
         if (ssPut(&conn.rx, buf, n) != 0 || processPackets(&conn, opts) != 0) break;
       }
     }
 
-    if (!*opts->stop) {
+    if (!MS_STOPPED(opts->stop)) {
       sendPacket(&conn, (uint8_t)(MS_MQTT_DISCONNECT << 4), NULL, 0);
     }
     closeConn(&conn);
     msLog(MS_LOG_WARN, "MQTT connection lost");
     if (opts->reconnects != NULL) ++(*opts->reconnects);
-    if (!*opts->stop) sleepInterruptible(backoff, opts->stop);
+    if (!MS_STOPPED(opts->stop)) sleepInterruptible(backoff, opts->stop);
   }
 
   closeConn(&conn);
+done:
   ssFree(&conn.rx);
 #ifdef _WIN32
   WSACleanup();
 #endif
-  final = 0;
   return final;
 }

@@ -54,7 +54,7 @@ typedef enum {
 
 typedef struct {
   char filter[MS_TEXT_LEN]; /* MQTT topic filter, may contain + and # */
-  int  qos;                 /* 0, 1 or 2 (QoS2 is downgraded to 1 on PUBACK) */
+  int  qos;                 /* 0, 1 or 2 */
 } SMsTopic;
 
 typedef struct {
@@ -181,9 +181,12 @@ int32_t msValidateConfig(const SMsCfg *cfg, char *err, int32_t errLen);
 /* Start the ingestion loop in the caller's thread (blocks until stopped). */
 int32_t msSrcRun(const SMsCfg *cfg, SMsSrc **ppSrc);
 
-/* Request a graceful stop. Safe to call from a signal handler / other thread. */
+/* Request a graceful stop. The stop flag uses an atomic store, so this is safe
+ * from another thread. When called from a signal/console-control handler, the
+ * caller must unregister that handler before calling msSrcFree(). */
 void msSrcStop(SMsSrc *src);
 
+/* Stats are updated without locks; only read after msSrcRun() has returned. */
 void msSrcStats(SMsSrc *src, SMsStats *stats);
 
 /* Release a handle returned by msSrcRun(). */

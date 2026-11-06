@@ -13,7 +13,10 @@
 #include <signal.h>
 #endif
 
-static SMsSrc *gSrc = NULL;
+/* Published once msSrcRun() has allocated the handle. Readers are the signal
+ * handler and (on Windows) the console-control thread; both are unregistered
+ * before the handle is released. */
+static SMsSrc *volatile gSrc = NULL;
 
 #ifdef _WIN32
 static BOOL WINAPI onConsoleCtrl(DWORD type) {
@@ -27,6 +30,11 @@ static BOOL WINAPI onConsoleCtrl(DWORD type) {
 static void onSignal(int sig) {
   (void)sig;
   msSrcStop(gSrc);
+}
+
+static void uninstallSignals(void) {
+  signal(SIGINT, SIG_DFL);
+  signal(SIGTERM, SIG_DFL);
 }
 #endif
 
@@ -100,11 +108,16 @@ int main(int argc, char **argv) {
 #endif
 
   int32_t rc = msSrcRun(&cfg, &gSrc);
-  SMsStats stats;
-  if (gSrc != NULL) {
-    msSrcStats(gSrc, &stats);
-    msSrcFree(gSrc);
-    gSrc = NULL;
-  }
+
+  /* Unregister first: a signal/console event arriving between free() and the
+   * NULL assignment used to dereference a freed handle (use-after-free). */
+#ifdef _WIN32
+  SetConsoleCtrlHandler(onConsoleCtrl, FALSE);
+#else
+  uninstallSignals();
+#endif
+  SMsSrc *s = gSrc;
+  gSrc = NULL;
+  msSrcFree(s);
   return rc == 0 ? 0 : 1;
 }

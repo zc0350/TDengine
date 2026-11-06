@@ -78,6 +78,12 @@ int32_t msSinkWrite(SMsSink *s, char **lines, int32_t num) {
     return 0;
   }
 
+  /* One reqid per batch, reused across all retries: the *_with_reqid* API
+   * de-duplicates by this id, so changing it per attempt can double-insert
+   * when the server committed but the client saw an error. */
+  int64_t reqid = s->reqid++;
+  if (s->reqid <= 0) s->reqid = 1;
+
   for (int32_t attempt = 0; attempt <= s->cfg.maxRetries; ++attempt) {
     if (attempt > 0) {
       msLog(MS_LOG_WARN, "retrying batch (%d/%d), rows=%d", attempt,
@@ -87,7 +93,7 @@ int32_t msSinkWrite(SMsSink *s, char **lines, int32_t num) {
 
     TAOS_RES *res = taos_schemaless_insert_ttl_with_reqid_tbname_key(
         s->taos, lines, num, TSDB_SML_LINE_PROTOCOL,
-        TSDB_SML_TIMESTAMP_MILLI_SECONDS, s->cfg.ttl, s->reqid++, s->tbnameKey);
+        TSDB_SML_TIMESTAMP_MILLI_SECONDS, s->cfg.ttl, reqid, s->tbnameKey);
 
     if (res != NULL) {
       int code = taos_errno(res);

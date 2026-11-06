@@ -80,6 +80,7 @@ if exist %binary_dir%\\test\\cfg\\taoskeeper.toml (
 copy %source_dir%\\include\\client\\taos.h %target_dir%\\include > nul
 copy %source_dir%\\include\\util\\taoserror.h %target_dir%\\include > nul
 copy %source_dir%\\include\\libs\\function\\taosudf.h %target_dir%\\include > nul
+copy %source_dir%\\include\\libs\\mqttsrc\\mqttsrc.h %target_dir%\\include > nul
 copy %binary_dir%\\build\\lib\\taos.lib %target_dir%\\driver > nul
 copy %binary_dir%\\build\\bin\\taos.dll %target_dir%\\ > nul
 copy %binary_dir%\\build\\bin\\taosnative.dll %target_dir%\\ > nul
@@ -139,7 +140,15 @@ if /I "%Enterprise%"=="TRUE" (
 copy %binary_dir%\\build\\bin\\taosd.exe %target_dir% > nul
 copy %binary_dir%\\build\\bin\\taosudf.exe %target_dir% > nul
 copy %binary_dir%\\build\\bin\\taosmqtt.exe %target_dir% > nul
-copy %binary_dir%\\build\\bin\\taosmqttsrc.exe %target_dir% > nul
+if exist "%binary_dir%\\build\\bin\\taosmqttsrc.exe" (
+    copy %binary_dir%\\build\\bin\\taosmqttsrc.exe %target_dir% > nul
+    if errorlevel 1 (
+        echo ERROR: failed to copy taosmqttsrc.exe
+        exit /b 1
+    )
+)
+if not exist "%target_dir%\\examples\\mqttsrc" mkdir "%target_dir%\\examples\\mqttsrc"
+copy "%source_dir%\\source\\libs\\mqttsrc\\conf\\*.example.json" "%target_dir%\\examples\\mqttsrc" > nul
 
 rem // ── Federated-query dependency package ──────────────────────────────────
 rem //   When INSTALL_FQ_RUNTIME_LIBS is ON the build stages the provider

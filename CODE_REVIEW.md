@@ -10,7 +10,49 @@
 
 ---
 
+## 0. 修复记录（2026-11-06 同日）
+
+下文第 1~6 节保留**首次审查时的历史基线**；本节记录随后完成的修复。共改动 25 个既有文件 + 新增 1 个测试文件。
+
+### 已修复
+
+| 原编号 | 修复内容 |
+|---|---|
+| P0-1 | `MsMsgCb` 改为返回 `int32_t`；QoS1/2 消息强制 flush **成功落库后**才发 PUBACK/PUBREC，失败不 ACK 并断连让 broker 重投；退出时 flush 失败或有失败批次即以非零码退出 |
+| P0-2 | 数值/整数列改为 `strtod`/`strtoll` 严格全串解析（`*end`/`ERANGE`/`isfinite`）后由 `%.17g`/`%lldi64` 重新格式化，不再回显原始 payload |
+| P0-3 | measurement 渲染到临时缓冲后经 `ssPutEscaped(...,1)` 转义；超长 topic 在 `msMapPayload` 明确拒绝 |
+| P1-1 | `sendAll` 改为 5s 总超时 + `select` 等可写 + 循环内检查 stop，EINTR/EAGAIN 不再无限忙循环 |
+| P1-2 | 退出前先注销信号/控制台处理器，再 `gSrc = NULL` 后 free；stop 标志改用编译器原子内建（`__atomic_*` / `_Interlocked*`）；删除未使用变量 |
+| P1-3 | QoS2 去重状态拆为 seen/remember/forget/reset，仅在落库成功后记录，PUBREL 清除，每次重连重置 |
+| P1-4 | 新增 `handleSubAck` + `waitSubAck`：校验 packetId 与每个 granted QoS，`0x80` 或超时触发重连 |
+| P1-5 | 主循环按 `lastRecvMs` 做半开检测（1.5×keepalive 无任何入站数据即重连） |
+| P1-6 | `msSinkWrite` 每批次取一个 reqid，整个重试周期复用；函数结束（成功或失败）才递增 |
+| P1-7 | rpm/deb/tar 三种清单补 `taosmqttsrc`；`preun.sh`/`prerm`/spec 卸载段补软链清理；示例配置与 `mqttsrc.h` 随包分发（`make_install.sh/.bat`、spec、makedeb、makepkg） |
+| P1-8 | `taosmqttsrc` 在 Darwin 下调用 `td_fix_macos_client_libtaos_dep()` |
+| P1-9 | `msStrCopy` 加 `src == dst` 短路，并对截断打 WARN |
+| P2-1~2、6 | `jint`/`msStrToInt` 加范围与尾随字符校验；枚举/布尔/数组类型与上限全部改为硬失败；`when` 空值不再产生 catch-all |
+| P2-3~5、7 | 新增长度感知的 `ssPutEscapedN`（控制字节含 NUL 替换为空格）；`toMilli` 饱和运算；时间戳/数值严格解析；64MB 超限明确报错 |
+| P2-8 | stop 原子化；公共头收紧 `msSrcStop`/`msSrcStats` 的线程与生命周期约定 |
+| P2-9~11 | 新增 `msSinkTest`（可注入 stub，覆盖重试次数/reqid 幂等/失败统计）；三个 e2e 场景接入 CTest；`msUnitTest` 默认路径改编译期宏、断言失败即中止、新增注入/转义/超长 topic 回归用例；`fake_mqtt_broker.py` 去掉 assert、初始化 stdout/stderr，设备场景年份改为占位符 |
+| P2-12 | cJSON 改为复用 `toolscJson` target（`add_subdirectory` + `target_link_libraries`），`tools/taosBenchmark/deps` 加 target guard，不再重复编译源码 |
+| P2-13~15 | 新增 `MQTTSRC_STRICT_WARNINGS` 开关（`-Wall -Wextra`）；Windows 安装检查 errorlevel；错误日志不再回显 payload 原值 |
+| 上游 P1 | `transComm.c` 两处 realloc 改用临时指针判空、增长前做加法与上界校验、收包入口补负长度/下界校验 |
+| 上游 P1 | `walChangeWrite` 六个错误分支改为 `TAOS_RETURN(terrno ? terrno : TSDB_CODE_FAILED)`，错误码来源不再失真 |
+| 上游 P2 | `osMemory.c` 修正未声明标识符、calloc/realloc 的整数溢出与窄化、`fopen` 判空 |
+
+### 部分缓解 / 未处理（需长期治理）
+
+- **P2-13**：严格告警开关默认 OFF（项目全局 `-Werror`，本机无编译器无法验证开启后是否零告警）。CI 可用 `-DMQTTSRC_STRICT_WARNINGS=ON` 开启。
+- **P2-12**：cJSON 已复用 target，但 `source/` 仍引用 `tools/taosBenchmark/deps/` 私有路径；彻底解耦需把该库上移到 `contrib/`，涉及更多构建文件。
+- **P1-2 理论 UB**：POSIX 信号处理器仍访问 `volatile` 句柄指针（已通过注销处理器消除 UAF 窗口、stop 用原子写）。彻底合规需自管道或 `sigwait` 转发线程。
+- **上游工程性风险**（第 4.2 节）：438 处 `strcpy`/219 处 `sprintf` 存量、147 个 >2000 行巨型文件、新旧错误约定并存、双轨依赖版本一致性、WAL 恢复静默降级、内存池分流设计风险 —— 属跨版本治理项，本轮未改。
+- **动态验证**：本机无 C 编译器，未执行 `cmake`/编译/CTest/fuzz。已完成的静态验证：`git diff --check`、`bash -n`（6 个脚本）、`python -m py_compile`、全部 JSON 解析、C/CMake 括号平衡、符号引用一致性复核。
+
+---
+
 ## 1. 结论摘要
+
+> 本节为**修复前基线**，修复状态见第 0 节。
 
 | 严重度 | 数量 | 主要主题 |
 |---|---|---|

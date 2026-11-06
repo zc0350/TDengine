@@ -155,6 +155,7 @@ cp ${compile_dir}/build/bin/taosudf                 ${pkg_dir}${install_home_pat
 cp ${compile_dir}/build/bin/taosBenchmark           ${pkg_dir}${install_home_path}/bin
 cp ${compile_dir}/build/bin/taosdump                ${pkg_dir}${install_home_path}/bin
 cp ${compile_dir}/build/bin/taosmqtt                ${pkg_dir}${install_home_path}/bin
+cp ${compile_dir}/build/bin/taosmqttsrc             ${pkg_dir}${install_home_path}/bin
 cp "${compile_dir}/build/bin/taosgen"               "${pkg_dir}${install_home_path}/bin"
 
 if [ -f "${compile_dir}/build/bin/taosadapter" ]; then
@@ -186,6 +187,7 @@ cp ${top_dir}/include/common/taosdef.h       ${pkg_dir}${install_home_path}/incl
 cp ${top_dir}/include/util/taoserror.h       ${pkg_dir}${install_home_path}/include
 cp ${top_dir}/include/util/tdef.h            ${pkg_dir}${install_home_path}/include
 cp ${top_dir}/include/libs/function/taosudf.h       ${pkg_dir}${install_home_path}/include
+cp ${top_dir}/include/libs/mqttsrc/mqttsrc.h         ${pkg_dir}${install_home_path}/include
 [ -f ${compile_dir}/build/include/taosws.h ] && cp ${compile_dir}/build/include/taosws.h            ${pkg_dir}${install_home_path}/include ||:
 # Example code was consolidated into docs/examples, but the layout inside the
 # package is frozen: the shipped subset and the historical directory names
@@ -207,6 +209,11 @@ while read -r ex_group ex_dst ex_src; do
     mkdir -p ${pkg_dir}${install_home_path}/examples/${ex_dst}/$(dirname "${ex_rel}")
     cp "${examples_dir}/${ex_src}" ${pkg_dir}${install_home_path}/examples/${ex_dst}/${ex_rel}
 done < "${examples_manifest}"
+
+# MQTT data source sample configs (not part of docs/examples).
+mkdir -p ${pkg_dir}${install_home_path}/examples/mqttsrc
+cp ${top_dir}/source/libs/mqttsrc/conf/*.example.json \
+   ${pkg_dir}${install_home_path}/examples/mqttsrc/
 #cp -r ${top_dir}/src/connector/python               ${pkg_dir}${install_home_path}/connector
 #cp -r ${top_dir}/src/connector/go                   ${pkg_dir}${install_home_path}/connector
 #cp -r ${top_dir}/src/connector/nodejs               ${pkg_dir}${install_home_path}/connector
