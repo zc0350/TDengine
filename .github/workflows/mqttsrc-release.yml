@@ -1,0 +1,194 @@
+# Copyright (c) 2026 TAOS Data, Inc. <jhtao@taosdata.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Build taosmqttsrc from a version tag, verify it, and publish a relocatable
+# Linux x64 bundle on the GitHub release. The bundle contains the executable,
+# the TDengine client libraries it needs, the example configs and the README.
+#
+# The configure/build commands deliberately go through build.sh so that this
+# workflow stays in step with tdengine-build.yml instead of duplicating (and
+# slowly drifting from) its CMake option list.
+
+name: mqttsrc Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: mqttsrc-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish taosmqttsrc
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      TD_CONFIG: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Same dependency set as tdengine-build.yml, plus patchelf (to make the
+      # bundle relocatable) and python3 (the fake-broker e2e tests).
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            gawk \
+            libgeos-dev \
+            libjansson-dev \
+            liblzma-dev \
+            libsnappy-dev \
+            libssl-dev \
+            libz-dev \
+            patchelf \
+            pkg-config \
+            python3 \
+            zlib1g
+
+      - name: Configure
+        run: ./build.sh gen -DMQTTSRC_ENABLE_TLS=ON
+
+      - name: Build taosmqttsrc and its tests
+        run: |
+          ./build.sh bld --target \
+            taosmqttsrc taosmqttsrcDryRun msUnitTest msSinkTest
+
+      # msUnitTest / msSinkTest / msE2EDefault / msE2EDevice / msE2ERules /
+      # msE2EReconnect. The e2e set drives the dry-run binary against a scripted
+      # MQTT 3.1.1 broker, so the whole publish is gated on protocol behaviour.
+      - name: Run mqttsrc tests
+        run: ctest --test-dir debug -C Release --output-on-failure -R '^ms'
+
+      - name: Package relocatable bundle
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-${GITHUB_SHA::7}"
+          fi
+          NAME="taosmqttsrc-${VERSION}-linux-x64"
+          OUT="dist/${NAME}"
+          rm -rf "${OUT}"
+          mkdir -p "${OUT}/bin" "${OUT}/lib" "${OUT}/examples"
+
+          cp debug/build/bin/taosmqttsrc "${OUT}/bin/"
+          chmod +x "${OUT}/bin/taosmqttsrc"
+
+          # libtaos.so is a thin dispatcher that dlopen()s libtaosnative.so from
+          # its own directory, so the two have to ship side by side. -a keeps
+          # the SONAME symlink chain instead of copying the payload twice.
+          find debug/build/lib -maxdepth 1 -name 'libtaos*.so*' \
+            -exec cp -a {} "${OUT}/lib/" \;
+
+          # Bundle every dependency except the glibc core, which has to come
+          # from the target machine. Copying the rest (libstdc++, libssl,
+          # libgeos_c, libsnappy, ...) is what makes the tarball self-contained;
+          # libtaos* alone would still need half of the build image.
+          is_glibc() {
+            case "$(basename "$1")" in
+              libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|libnsl.so*|ld-linux*|linux-vdso*) return 0 ;;
+            esac
+            return 1
+          }
+          # Copying a library can pull in further libraries, so iterate until
+          # the set stops growing.
+          for _ in 1 2 3 4 5; do
+            before=$(find "${OUT}/lib" -maxdepth 1 -type f | wc -l)
+            find "${OUT}/lib" -maxdepth 1 -type f -name '*.so*' -print0 |
+              xargs -0 -r ldd 2>/dev/null | awk '/=> \// {print $3}' | sort -u |
+              while read -r dep; do
+                if is_glibc "${dep}"; then continue; fi
+                if [ -f "${dep}" ] && [ ! -e "${OUT}/lib/$(basename "${dep}")" ]; then
+                  # -L: ldd reports SONAME symlinks, and a dangling link inside
+                  # the bundle would never resolve. The basename is the SONAME,
+                  # which is exactly the name the loader looks for.
+                  cp -L "${dep}" "${OUT}/lib/"
+                fi
+              done
+            if [ "$(find "${OUT}/lib" -maxdepth 1 -type f | wc -l)" = "${before}" ]; then break; fi
+          done
+
+          patchelf --set-rpath '$ORIGIN/../lib' "${OUT}/bin/taosmqttsrc"
+          find "${OUT}/lib" -maxdepth 1 -type f -name '*.so*' \
+            -exec patchelf --set-rpath '$ORIGIN' {} \;
+
+          cp source/libs/mqttsrc/conf/*.example.json "${OUT}/examples/"
+          cp source/libs/mqttsrc/README.md "${OUT}/"
+
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+      - name: Smoke-test the bundle
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls dist/*.tar.gz | head -1)
+          rm -rf /tmp/mqttsrc-smoke && mkdir -p /tmp/mqttsrc-smoke
+          tar -C /tmp/mqttsrc-smoke -xzf "${ARCHIVE}"
+          ROOT=$(find /tmp/mqttsrc-smoke -maxdepth 1 -mindepth 1 -type d | head -1)
+
+          echo "--- bundle contents"
+          find "${ROOT}" -maxdepth 2 -type f | sort
+          echo "--- ldd"
+          ldd "${ROOT}/bin/taosmqttsrc" || true
+
+          # No LD_LIBRARY_PATH: the RPATH has to be self-sufficient.
+          "${ROOT}/bin/taosmqttsrc" --version
+          for conf in "${ROOT}"/examples/*.example.json; do
+            "${ROOT}/bin/taosmqttsrc" -c "${conf}" --check
+          done
+
+          # --version never connects, so it never dlopen()s libtaosnative.so;
+          # assert the search paths structurally rather than by side effect.
+          readelf -d "${ROOT}/bin/taosmqttsrc" | grep -Eq '(RUNPATH|RPATH)'
+          for f in $(find "${ROOT}/lib" -maxdepth 1 -type f -name '*.so*'); do
+            readelf -d "${f}" | grep -Eq '(RUNPATH|RPATH)'
+          done
+          echo "every binary in the bundle carries an RPATH"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: taosmqttsrc-linux-x64
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: taosmqttsrc ${{ github.ref_name }}
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ## taosmqttsrc ${{ github.ref_name }}
+
+            Linux x64 bundle with TLS support (OpenSSL), the TDengine client
+            libraries it needs, the example configs and the README.
+
+            ```bash
+            tar -xzf taosmqttsrc-*-linux-x64.tar.gz
+            ./taosmqttsrc-*/bin/taosmqttsrc --version
+            ./taosmqttsrc-*/bin/taosmqttsrc -c ./taosmqttsrc-*/examples/mqttsrc.example.json --check
+            ```
+
+            See `README.md` inside the bundle for the configuration reference
+            and the delivery semantics.
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

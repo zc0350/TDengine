@@ -1,6 +1,12 @@
 {
+  "_comment": "规则路由场景：5 条记录覆盖 4 条规则 + 默认回退，最后一毫秒级时间戳规则使用 QoS2。",
   "topic": "factory/bj/telemetry",
-  "qos": [0, 1, 0, 0, 1],
+  "clean_session": false,
+  "ping": true,
+  "batch_size": 5,
+  "flush_ms": 50,
+  "run_ms": 3000,
+  "qos": [0, 1, 0, 0, 2],
   "payloads": [
     {"type": "temperature", "dev": "d1", "ts": 1730000000000, "temp": 23.5, "unit": "C"},
     {"type": "power", "dev": "p1", "ts": 1730000000001, "kw": 12, "on": true, "line": "L1"},

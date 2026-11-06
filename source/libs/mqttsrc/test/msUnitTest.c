@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "mqttsrc.h"
 
@@ -370,6 +371,129 @@ static void testRules(const char *path) {
   free(out);
 }
 
+static int32_t loadFromText(const char *text, SMsCfg *cfg, char *err, int32_t errLen) {
+  char path[64];
+  snprintf(path, sizeof(path), "ms_unit_%lu.json", (unsigned long)clock());
+  FILE *fp = fopen(path, "wb");
+  if (fp == NULL) return -2;
+  fwrite(text, 1, strlen(text), fp);
+  fclose(fp);
+  int32_t rc = msLoadConfig(path, cfg, err, errLen);
+  remove(path);
+  return rc;
+}
+
+/* Every "wrong configuration that used to run silently" case must fail at
+ * load/validate time. */
+static void testConfigValidation(void) {
+  SMsCfg cfg;
+  char err[MS_ERR_LEN];
+
+  msCfgDefault(&cfg);
+  CHECK(cfg.broker.cleanSession == false, "clean_session defaults to false");
+  CHECK(strncmp(cfg.broker.clientId, "taosx-mqttsrc-", 14) == 0,
+        "default client id is unique per host/process");
+  CHECK(cfg.sink.queueSize > 0, "write queue has a default size");
+
+  /* Built-ins must resolve; unknown underscore keys are typos. */
+  msCfgDefault(&cfg);
+  snprintf(cfg.broker.topics[0].filter, MS_TEXT_LEN, "%s", "a/#");
+  cfg.broker.topicNum = 1;
+  cfg.mapping.columnNum = 1;
+  snprintf(cfg.mapping.columns[0].name, MS_NAME_LEN, "%s", "v");
+  snprintf(cfg.mapping.columns[0].path, MS_PATH_LEN, "%s", "v");
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{dev}_{_year}");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == 0, err);
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{dev");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "unclosed '{' rejected");
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{}");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "empty placeholder rejected");
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{_bogus}");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "unknown builtin rejected");
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{a b}");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "invalid key character rejected");
+  snprintf(cfg.mapping.table, MS_NAME_LEN, "%s", "t_{dev}");
+  snprintf(cfg.mapping.tbnameKey, MS_NAME_LEN, "%s", "tbname,evil=1");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "unsafe tbname_key rejected");
+  snprintf(cfg.mapping.tbnameKey, MS_NAME_LEN, "%s", "tbname");
+  snprintf(cfg.broker.password, MS_TEXT_LEN, "%s", "secret");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1,
+        "password without username rejected");
+  snprintf(cfg.broker.password, MS_TEXT_LEN, "%s", "");
+  cfg.sink.queueSize = 0;
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "queue_size 0 rejected");
+  cfg.sink.queueSize = 100;
+  cfg.broker.tls = true;
+#ifndef MS_WITH_TLS
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1,
+        "TLS request rejected by a build without TLS");
+#endif
+  cfg.broker.tls = false;
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == 0, err);
+
+  /* Ports are 16-bit protocol values: out-of-range values must be rejected,
+   * not truncated into a different port. */
+  const char *base =
+      "{\"mqtt\":{\"port\":%d,\"topics\":[{\"filter\":\"a/#\",\"qos\":1}]},"
+      "\"tdengine\":{\"database\":\"d1\"},"
+      "\"mapping\":{\"columns\":[{\"name\":\"v\",\"path\":\"v\"}]}}";
+  char json[512];
+  snprintf(json, sizeof(json), base, 70000);
+  CHECK(loadFromText(json, &cfg, err, sizeof(err)) == -1, "port 70000 rejected");
+  snprintf(json, sizeof(json), base, -1);
+  CHECK(loadFromText(json, &cfg, err, sizeof(err)) == -1, "negative port rejected");
+  snprintf(json, sizeof(json), base, 1883);
+  CHECK(loadFromText(json, &cfg, err, sizeof(err)) == 0, err);
+
+  const char *unknown =
+      "{\"mqtt\":{\"topicz\":[],\"topics\":[{\"filter\":\"a/#\",\"qos\":1}]},"
+      "\"mapping\":{\"columnX\":1,\"columns\":[{\"name\":\"v\",\"path\":\"v\"}]}}";
+  CHECK(loadFromText(unknown, &cfg, err, sizeof(err)) == -1,
+        "unknown config key rejected");
+
+  const char *badTemplate =
+      "{\"mqtt\":{\"topics\":[{\"filter\":\"a/#\",\"qos\":1}]},"
+      "\"mapping\":{\"table\":\"t_{dev\",\"columns\":[{\"name\":\"v\",\"path\":\"v\"}]}}";
+  CHECK(loadFromText(badTemplate, &cfg, err, sizeof(err)) == -1,
+        "broken template rejected at load time");
+}
+
+/* A value longer than MS_VALUE_LEN must fail loudly instead of being cut. */
+static void testLongValue(const SMsCfg *base) {
+  SMsCfg cfg = *base;
+  char err[MS_ERR_LEN];
+  char *out = NULL;
+  int32_t num = 0;
+
+  size_t len = MS_VALUE_LEN + 400;
+  size_t cap = len + 256;
+  char *payload = (char *)malloc(cap);
+  CHECK(payload != NULL, "payload buffer");
+  int32_t n = snprintf(payload, cap,
+                       "{\"ts\":1730000000000,\"dev\":\"d1\",\"current\":1,"
+                       "\"voltage\":2,\"running\":true,\"note\":\"");
+  memset(payload + n, 'N', len);
+  n += (int32_t)len;
+  payload[n++] = '"';
+  payload[n++] = '}';
+  payload[n] = '\0';
+
+  int32_t rc = msMapPayload(&cfg, payload, n, "factory/bj/telemetry",
+                            1730000000000LL, &out, &num, err, sizeof(err));
+  CHECK(rc == -1 && out == NULL, "over-long column value rejected");
+  free(payload);
+
+  /* Exactly at the limit still fits. */
+  const char *small = "{\"ts\":1730000000000,\"dev\":\"d1\",\"current\":1,"
+                      "\"voltage\":2,\"running\":true,\"note\":\"ok\"}";
+  out = NULL;
+  num = 0;
+  rc = msMapPayload(&cfg, small, (int32_t)strlen(small), "factory/bj/telemetry",
+                    1730000000000LL, &out, &num, err, sizeof(err));
+  CHECK(rc == 0 && num == 1, err);
+  free(out);
+}
+
 static void testRawColumns(void) {
   SMsCfg cfg;
   msCfgDefault(&cfg);
@@ -437,7 +561,9 @@ int main(int argc, char **argv) {
   if (msLoadConfig(path, &cfg, err, sizeof(err)) == 0) {
     testMapping(&cfg);
     testTimestamp(&cfg);
+    testLongValue(&cfg);
   }
+  testConfigValidation();
   testRules(rulesPath);
   testRawColumns();
   fprintf(stdout, "msUnitTest: %d passed, %d failed\n", gPass, gFail);

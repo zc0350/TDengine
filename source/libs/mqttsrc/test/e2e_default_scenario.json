@@ -1,0 +1,18 @@
+{
+  "_comment": "默认场景：QoS0 + QoS1 混合，批量刷新（batch_size=5/flush_ms=50）后统一回 PUBACK，并验证 PINGREQ/PINGRESP。",
+  "topic": "factory/bj/telemetry",
+  "clean_session": false,
+  "ping": true,
+  "batch_size": 5,
+  "flush_ms": 50,
+  "run_ms": 2500,
+  "qos": [0, 1],
+  "payloads": [
+    {"ts": 1730000000000, "dev": "d1", "current": 12, "voltage": 220.5, "running": true, "note": "ok"},
+    {"ts": 1730000000001, "dev": "d2", "current": 13, "voltage": 221, "running": false, "note": "hi"}
+  ],
+  "expected": [
+    "meters,device=d1,site=bj,tbname=t_d1_bj current=12,voltage=220.5,running=true,note=\"ok\" 1730000000000",
+    "meters,device=d2,site=bj,tbname=t_d2_bj current=13,voltage=221,running=false,note=\"hi\" 1730000000001"
+  ]
+}

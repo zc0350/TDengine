@@ -1,4 +1,5 @@
 {
+  "stats_interval_ms": 60000,
   "mqtt": {
     "host": "127.0.0.1",
     "port": 1883,
@@ -6,10 +7,18 @@
     "username": "",
     "password": "",
     "keepalive": 60,
-    "clean_session": true,
+    "clean_session": false,
     "reconnect_ms": 1000,
     "max_reconnect_ms": 30000,
     "connect_timeout_ms": 5000,
+    "tls": {
+      "enabled": false,
+      "ca_file": "",
+      "cert_file": "",
+      "key_file": "",
+      "insecure_skip_verify": false,
+      "server_name": ""
+    },
     "topics": [
       { "filter": "factory/+/telemetry", "qos": 1 }
     ],
@@ -27,6 +36,7 @@
     "max_retries": 3,
     "retry_ms": 500,
     "ttl": 0,
+    "queue_size": 10000,
     "dry_run": false
   },
   "mapping": {

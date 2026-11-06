@@ -32,7 +32,16 @@ target_include_directories(
             "${TD_SOURCE_DIR}/include/client"
             "${TD_SOURCE_DIR}/include"
 )
-target_link_libraries(mqttsrc PUBLIC toolscJson)
+target_link_libraries(mqttsrc PUBLIC toolscJson Threads::Threads)
+
+# Optional TLS (OpenSSL). Without it, "mqtt.tls.enabled" is rejected at config
+# load time instead of silently sending credentials in clear text.
+option(MQTTSRC_ENABLE_TLS "Build mqttsrc with TLS support (OpenSSL)" OFF)
+if(MQTTSRC_ENABLE_TLS)
+    find_package(OpenSSL REQUIRED)
+    target_compile_definitions(mqttsrc PRIVATE MS_WITH_TLS=1)
+    target_link_libraries(mqttsrc PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 if(TD_WINDOWS)
     target_link_libraries(mqttsrc PUBLIC ws2_32)

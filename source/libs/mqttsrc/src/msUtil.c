@@ -17,8 +17,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #else
 #include <sys/time.h>
+#include <unistd.h>
 #endif
 
 static int32_t gLogLevel = MS_LOG_INFO;
@@ -62,6 +64,129 @@ void msSleepMs(int32_t ms) {
   Sleep((DWORD)ms);
 #else
   usleep((useconds_t)ms * 1000);
+#endif
+}
+
+/* ---------------- threads ---------------- */
+/* Windows condition variables are modelled with auto-reset events: signalling
+ * while the predicate is still guarded by the mutex cannot be lost, and an
+ * event that fires before the wait stays signalled until it is consumed. */
+
+void msMutexInit(MsMutex *m) {
+#ifdef _WIN32
+  InitializeCriticalSection(m);
+#else
+  pthread_mutex_init(m, NULL);
+#endif
+}
+
+void msMutexDestroy(MsMutex *m) {
+#ifdef _WIN32
+  DeleteCriticalSection(m);
+#else
+  pthread_mutex_destroy(m);
+#endif
+}
+
+void msMutexLock(MsMutex *m) {
+#ifdef _WIN32
+  EnterCriticalSection(m);
+#else
+  pthread_mutex_lock(m);
+#endif
+}
+
+void msMutexUnlock(MsMutex *m) {
+#ifdef _WIN32
+  LeaveCriticalSection(m);
+#else
+  pthread_mutex_unlock(m);
+#endif
+}
+
+void msCondInit(MsCond *c) {
+#ifdef _WIN32
+  *c = CreateEventA(NULL, FALSE, FALSE, NULL);
+#else
+  pthread_cond_init(c, NULL);
+#endif
+}
+
+void msCondDestroy(MsCond *c) {
+#ifdef _WIN32
+  if (*c != NULL) CloseHandle(*c);
+  *c = NULL;
+#else
+  pthread_cond_destroy(c);
+#endif
+}
+
+void msCondWait(MsCond *c, MsMutex *m) { msCondWaitMs(c, m, -1); }
+
+void msCondWaitMs(MsCond *c, MsMutex *m, int32_t ms) {
+#ifdef _WIN32
+  LeaveCriticalSection(m);
+  if (ms < 0) {
+    WaitForSingleObject(*c, INFINITE);
+  } else {
+    WaitForSingleObject(*c, (DWORD)ms);
+  }
+  EnterCriticalSection(m);
+#else
+  if (ms < 0) {
+    pthread_cond_wait(c, m);
+    return;
+  }
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec += ms / 1000;
+  ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += 1;
+    ts.tv_nsec -= 1000000000L;
+  }
+  pthread_cond_timedwait(c, m, &ts);
+#endif
+}
+
+void msCondSignal(MsCond *c) {
+#ifdef _WIN32
+  SetEvent(*c);
+#else
+  pthread_cond_signal(c);
+#endif
+}
+
+void msCondBroadcast(MsCond *c) {
+#ifdef _WIN32
+  SetEvent(*c);
+#else
+  pthread_cond_broadcast(c);
+#endif
+}
+
+int32_t msThreadStart(MsThread *t, void *(*fn)(void *), void *arg) {
+  if (t == NULL || fn == NULL) return -1;
+#ifdef _WIN32
+  /* _beginthreadex expects an unsigned __stdcall entry point. The cast below is
+   * the documented way to pass a void* signature; the calling convention is
+   * identical on x64 and both use the cdecl stack on x86. */
+  uintptr_t h = _beginthreadex(NULL, 0, (unsigned(__stdcall *)(void *))fn, arg, 0, NULL);
+  if (h == 0) return -1;
+  *t = (HANDLE)h;
+  return 0;
+#else
+  return pthread_create(t, NULL, fn, arg) == 0 ? 0 : -1;
+#endif
+}
+
+void msThreadJoin(MsThread t) {
+#ifdef _WIN32
+  if (t == NULL) return;
+  WaitForSingleObject(t, INFINITE);
+  CloseHandle(t);
+#else
+  pthread_join(t, NULL);
 #endif
 }
 
@@ -200,7 +325,7 @@ int32_t msRender(const char *tpl, MsLookup lookup, void *arg, SStr *out) {
     memcpy(key, p + 1, (size_t)keyLen);
     key[keyLen] = '\0';
 
-    char val[MS_TEXT_LEN];
+    char val[MS_VALUE_LEN];
     if (lookup == NULL || lookup(arg, key, val, (int32_t)sizeof(val)) != 0) return -1;
     if (ssPutStr(out, val) != 0) return -1;
     p = end + 1;
@@ -242,15 +367,22 @@ int32_t msJsonPath(tools_cJSON *root, const char *path, SMsValue *val) {
     double d = node->valuedouble;
     if (d > -9.0e18 && d < 9.0e18 && d == (double)(long long)d) {
       val->type = MSV_INT;
-      snprintf(val->text, sizeof(val->text), "%lld", (long long)d);
+      if (snprintf(val->text, sizeof(val->text), "%lld", (long long)d) >= (int)sizeof(val->text)) {
+        val->truncated = 1;
+      }
     } else {
       val->type = MSV_DOUBLE;
-      snprintf(val->text, sizeof(val->text), "%.17g", d);
+      if (snprintf(val->text, sizeof(val->text), "%.17g", d) >= (int)sizeof(val->text)) {
+        val->truncated = 1;
+      }
     }
   } else if (tools_cJSON_IsString(node)) {
     val->type = MSV_STRING;
-    if (node->valuestring != NULL) {
-      snprintf(val->text, sizeof(val->text), "%s", node->valuestring);
+    if (node->valuestring != NULL &&
+        snprintf(val->text, sizeof(val->text), "%s", node->valuestring) >= (int)sizeof(val->text)) {
+      /* Never hand a shortened value to a column or a tag: the caller turns
+       * this into a per-message error instead of writing corrupt data. */
+      val->truncated = 1;
     }
   } else if (tools_cJSON_IsTrue(node) || tools_cJSON_IsFalse(node)) {
     val->type = MSV_BOOL;
@@ -262,7 +394,9 @@ int32_t msJsonPath(tools_cJSON *root, const char *path, SMsValue *val) {
     val->type = MSV_OTHER;
     char *printed = tools_cJSON_PrintUnformatted(node);
     if (printed != NULL) {
-      snprintf(val->text, sizeof(val->text), "%s", printed);
+      if (snprintf(val->text, sizeof(val->text), "%s", printed) >= (int)sizeof(val->text)) {
+        val->truncated = 1;
+      }
       free(printed);
     }
   }
@@ -293,4 +427,113 @@ void msStrCopy(char *dst, int32_t cap, const char *src) {
     msLog(MS_LOG_WARN, "config string truncated to %d bytes", cap - 1);
   }
   snprintf(dst, (size_t)cap, "%s", src);
+}
+
+void msDefaultClientId(char *buf, int32_t cap) {
+  if (buf == NULL || cap <= 0) return;
+  char host[64];
+  memset(host, 0, sizeof(host));
+#ifdef _WIN32
+  DWORD hostLen = (DWORD)sizeof(host);
+  if (!GetComputerNameA(host, &hostLen)) snprintf(host, sizeof(host), "%s", "host");
+  unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+  if (gethostname(host, sizeof(host) - 1) != 0) snprintf(host, sizeof(host), "%s", "host");
+  unsigned long pid = (unsigned long)getpid();
+#endif
+  host[sizeof(host) - 1] = '\0';
+  /* MQTT 3.1.1 leaves the client id character set to the server; keep it to
+   * the safe subset every broker accepts. */
+  for (char *p = host; *p != '\0'; ++p) {
+    unsigned char c = (unsigned char)*p;
+    if (!isalnum(c) && c != '-') *p = '-';
+  }
+  snprintf(buf, (size_t)cap, "taosx-mqttsrc-%s-%lu", host, pid);
+}
+
+/* ---------------- template validation ---------------- */
+
+static bool isBuiltinVar(const char *key) {
+  static const char *const builtins[] = {
+      "_topic", "_topic_flat", "_now", "_ts", "_year", "_month", "_day",
+      "_server_year"};
+  for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); ++i) {
+    if (strcmp(key, builtins[i]) == 0) return true;
+  }
+  return false;
+}
+
+static bool isTopicVar(const char (*vars)[MS_NAME_LEN], int32_t varNum, const char *key) {
+  if (vars == NULL) return false;
+  for (int32_t i = 0; i < varNum; ++i) {
+    if (strcmp(vars[i], key) == 0) return true;
+  }
+  return false;
+}
+
+static void setTmplErr(char *err, int32_t errLen, const char *fmt, ...) {
+  if (err == NULL || errLen <= 0) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(err, (size_t)errLen, fmt, ap);
+  va_end(ap);
+}
+
+int32_t msValidateTemplate(const char *tpl, const char *what,
+                           const char (*vars)[MS_NAME_LEN], int32_t varNum,
+                           char *err, int32_t errLen) {
+  if (tpl == NULL) {
+    setTmplErr(err, errLen, "%s: missing template", what);
+    return -1;
+  }
+  const char *p = tpl;
+  while (*p != '\0') {
+    if (*p == '}') {
+      setTmplErr(err, errLen, "%s: unbalanced '}' in '%s'", what, tpl);
+      return -1;
+    }
+    if (*p != '{') {
+      ++p;
+      continue;
+    }
+    const char *end = strchr(p + 1, '}');
+    if (end == NULL) {
+      setTmplErr(err, errLen, "%s: unclosed '{' in '%s'", what, tpl);
+      return -1;
+    }
+    int32_t keyLen = (int32_t)(end - p - 1);
+    if (keyLen == 0) {
+      setTmplErr(err, errLen, "%s: empty placeholder '{}' in '%s'", what, tpl);
+      return -1;
+    }
+    if (keyLen >= MS_PATH_LEN) {
+      setTmplErr(err, errLen, "%s: placeholder longer than %d bytes", what,
+                 MS_PATH_LEN - 1);
+      return -1;
+    }
+    char key[MS_PATH_LEN];
+    memcpy(key, p + 1, (size_t)keyLen);
+    key[keyLen] = '\0';
+    /* Mirrors the documented key syntax: JSON paths, topic variables and
+     * builtins. Anything else (spaces, commas, nested braces) is a typo that
+     * would otherwise only surface as a silent drop per message. */
+    for (int32_t i = 0; i < keyLen; ++i) {
+      unsigned char c = (unsigned char)key[i];
+      if (!(isalnum(c) || c == '_' || c == '-' || c == '.' || c == '$')) {
+        setTmplErr(err, errLen, "%s: invalid character '%c' in placeholder '{%s}'",
+                   what, key[i], key);
+        return -1;
+      }
+    }
+    /* "_" is reserved for builtins; an unknown one is a configuration error,
+     * not a payload field (payload paths are normally not underscore-prefixed). */
+    if (key[0] == '_' && !isBuiltinVar(key) && !isTopicVar(vars, varNum, key)) {
+      setTmplErr(err, errLen, "%s: unknown builtin '{%s}' (known: _topic, "
+                              "_topic_flat, _now, _ts, _year, _month, _day, "
+                              "_server_year)", what, key);
+      return -1;
+    }
+    p = end + 1;
+  }
+  return 0;
 }

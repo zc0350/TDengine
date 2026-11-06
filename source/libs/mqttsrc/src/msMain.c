@@ -13,15 +13,22 @@
 #include <signal.h>
 #endif
 
-/* Published once msSrcRun() has allocated the handle. Readers are the signal
- * handler and (on Windows) the console-control thread; both are unregistered
- * before the handle is released. */
-static SMsSrc *volatile gSrc = NULL;
+/* Published by msSrcRun() before it blocks. Readers are the signal handler and
+ * (on Windows) the console-control thread; both are unregistered before the
+ * handle is released. Access goes through MS_PTR_LOAD/MS_PTR_STORE so the
+ * pointer is neither optimized away nor qualified in a way that MSVC rejects
+ * when passing &gSrc to msSrcRun(). */
+static SMsSrc *gSrc = NULL;
+
+static void requestStop(void) {
+  SMsSrc *src = (SMsSrc *)MS_PTR_LOAD(&gSrc);
+  if (src != NULL) msSrcStop(src);
+}
 
 #ifdef _WIN32
 static BOOL WINAPI onConsoleCtrl(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
-    msSrcStop(gSrc);
+    requestStop();
     return TRUE;
   }
   return FALSE;
@@ -29,7 +36,7 @@ static BOOL WINAPI onConsoleCtrl(DWORD type) {
 #else
 static void onSignal(int sig) {
   (void)sig;
-  msSrcStop(gSrc);
+  requestStop();
 }
 
 static void uninstallSignals(void) {
@@ -38,12 +45,36 @@ static void uninstallSignals(void) {
 }
 #endif
 
+typedef struct {
+  int32_t runMs;
+} SMsRunTimer;
+
+static volatile int32_t gTimerCancel = 0;
+
+static void *timerMain(void *arg) {
+  const SMsRunTimer *t = (const SMsRunTimer *)arg;
+  /* Wait until msSrcRun() published the handle, then count down. Both loops
+   * poll so a signal-triggered shutdown never waits for the full duration. */
+  for (int32_t waited = 0; waited < 5000; waited += 50) {
+    if (MS_PTR_LOAD(&gSrc) != NULL) break;
+    msSleepMs(50);
+  }
+  int32_t left = t->runMs;
+  while (left > 0 && !MS_STOPPED(&gTimerCancel) && MS_PTR_LOAD(&gSrc) != NULL) {
+    msSleepMs(50);
+    left -= 50;
+  }
+  if (!MS_STOPPED(&gTimerCancel) && MS_PTR_LOAD(&gSrc) != NULL) requestStop();
+  return NULL;
+}
+
 static void usage(const char *exe) {
   fprintf(stderr,
           "Usage: %s -c <config.json> [options]\n"
           "  -c, --config <path>   JSON config file (required)\n"
           "  -n, --dry-run         print line protocol instead of writing to TDengine\n"
           "      --check           validate config and exit\n"
+          "      --exit-after-ms <n>  stop gracefully after n milliseconds\n"
           "  -v, --verbose         debug logging\n"
           "  -h, --help            show this help\n"
           "      --version         show version\n",
@@ -55,6 +86,7 @@ int main(int argc, char **argv) {
   bool dryRun = false;
   bool checkOnly = false;
   bool verbose = false;
+  int32_t exitAfterMs = 0;
 
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];
@@ -64,6 +96,12 @@ int main(int argc, char **argv) {
       dryRun = true;
     } else if (strcmp(a, "--check") == 0) {
       checkOnly = true;
+    } else if (strcmp(a, "--exit-after-ms") == 0 && i + 1 < argc) {
+      exitAfterMs = msStrToInt(argv[++i], 0);
+      if (exitAfterMs <= 0) {
+        fprintf(stderr, "--exit-after-ms needs a positive number\n");
+        return 1;
+      }
     } else if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {
       verbose = true;
     } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
@@ -107,7 +145,21 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
 #endif
 
+  SMsRunTimer timer;
+  timer.runMs = exitAfterMs;
+  MsThread timerThread;
+  memset(&timerThread, 0, sizeof(timerThread));
+  int32_t timerStarted = 0;
+  if (exitAfterMs > 0) {
+    if (msThreadStart(&timerThread, timerMain, &timer) == 0) timerStarted = 1;
+  }
+
   int32_t rc = msSrcRun(&cfg, &gSrc);
+
+  if (timerStarted) {
+    MS_ATOMIC_STORE(&gTimerCancel, 1);
+    msThreadJoin(timerThread);
+  }
 
   /* Unregister first: a signal/console event arriving between free() and the
    * NULL assignment used to dereference a freed handle (use-after-free). */
@@ -116,8 +168,8 @@ int main(int argc, char **argv) {
 #else
   uninstallSignals();
 #endif
-  SMsSrc *s = gSrc;
-  gSrc = NULL;
+  SMsSrc *s = (SMsSrc *)MS_PTR_LOAD(&gSrc);
+  MS_PTR_STORE(&gSrc, NULL);
   msSrcFree(s);
   return rc == 0 ? 0 : 1;
 }

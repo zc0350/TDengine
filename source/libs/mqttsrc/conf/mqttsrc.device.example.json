@@ -1,10 +1,12 @@
 {
   "_comment": "设备上报消息映射：event/deviceCode/imei 作为普通列，完整 payload 写入 data 列。time 是秒级时间戳。alarms 消息没有 imei，该列用 auto 类型让缺失时自动省略（落库为 NULL）。",
+  "stats_interval_ms": 60000,
   "mqtt": {
     "host": "127.0.0.1",
     "port": 1883,
     "client_id": "taosx-device-ingest",
     "keepalive": 60,
+    "clean_session": false,
     "topics": [
       { "filter": "device/+/up", "qos": 1 }
     ]
@@ -18,6 +20,7 @@
     "create_db": true,
     "batch_size": 500,
     "flush_ms": 200,
+    "queue_size": 10000,
     "dry_run": false
   },
   "mapping": {

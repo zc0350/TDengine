@@ -6,14 +6,31 @@
  *
  * Supported: CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH (QoS 0/1/2),
  * PUBACK/PUBREC/PUBREL/PUBCOMP, PINGREQ/PINGRESP, DISCONNECT,
- * username/password, keepalive, exponential reconnect + re-subscribe.
- * Not supported: TLS, MQTT 5.0, will message, session persistence.
+ * username/password, keepalive, exponential reconnect + re-subscribe,
+ * optional TLS (OpenSSL, -DMQTTSRC_ENABLE_TLS=ON).
+ * Not supported: MQTT 5.0, will message.
+ *
+ * QoS1/2 ACKs are *not* sent from handlePublish(): the message is queued for
+ * the writer thread and the ACK is emitted once the batch has been accepted
+ * by TDengine. A sink failure therefore leaves the message unacknowledged and
+ * the broker redelivers it after the reconnect.
  *
  * contrib/libmqtt only ships a broker and client *headers*, so the wire
  * protocol is implemented here rather than linked from that library.
  */
 
 #include "msInt.h"
+
+#include <ctype.h>
+
+#ifdef MS_WITH_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#endif
+#endif
 
 #ifdef _WIN32
 typedef SOCKET MsFd;
@@ -39,12 +56,19 @@ typedef int MsFd;
 
 typedef struct {
   MsFd              fd;
+  void             *tlsCtx; /* SSL_CTX*, NULL without TLS */
+  void             *tls;    /* SSL*, NULL without TLS */
   SStr              rx;
   int64_t           lastSendMs;
   int64_t           lastRecvMs;
   uint16_t          nextId;
+  /* ids whose QoS2 PUBLISH has been persisted (PUBREC sent) */
   uint16_t          qos2Seen[256];
-  int32_t           qos2Pos;
+  /* ids queued but not yet persisted; a duplicate is ignored instead of
+   * being written twice */
+  uint16_t          qos2Pending[256];
+  int32_t           qos2SeenPos;
+  int32_t           qos2PendingPos;
   volatile int32_t *stop;
   uint16_t          pendingSubId;
   int32_t           subAckResult; /* -2 pending, 0 accepted, -1 rejected */
@@ -118,21 +142,231 @@ static int32_t buildPacket(SStr *out, uint8_t typeFlags, const char *body, int32
   return bodyLen > 0 ? ssPut(out, body, bodyLen) : 0;
 }
 
+/* ---------------- TLS ---------------- */
+
+#ifdef MS_WITH_TLS
+static bool isIpLiteral(const char *h) {
+  unsigned char buf[16];
+  if (h == NULL) return false;
+#ifdef _WIN32
+  return InetPtonA(AF_INET, h, buf) == 1 || InetPtonA(AF_INET6, h, buf) == 1;
+#else
+  return inet_pton(AF_INET, h, buf) == 1 || inet_pton(AF_INET6, h, buf) == 1;
+#endif
+}
+
+static void tlsLogError(const char *what) {
+  unsigned long e = ERR_get_error();
+  char buf[256];
+  if (e != 0) {
+    ERR_error_string_n(e, buf, sizeof(buf));
+    msLog(MS_LOG_ERROR, "%s failed: %s", what, buf);
+  } else {
+    msLog(MS_LOG_ERROR, "%s failed", what);
+  }
+}
+#endif
+
+static void tlsClose(SMsConn *c) {
+#ifdef MS_WITH_TLS
+  if (c->tls != NULL) {
+    SSL_shutdown((SSL *)c->tls);
+    SSL_free((SSL *)c->tls);
+    c->tls = NULL;
+  }
+  if (c->tlsCtx != NULL) {
+    SSL_CTX_free((SSL_CTX *)c->tlsCtx);
+    c->tlsCtx = NULL;
+  }
+#else
+  c->tls = NULL;
+  c->tlsCtx = NULL;
+#endif
+}
+
+static int32_t tlsHandshake(SMsConn *c, const SMsBrokerCfg *cfg) {
+#ifdef MS_WITH_TLS
+  SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+  if (ctx == NULL) {
+    tlsLogError("SSL_CTX_new");
+    return -1;
+  }
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+  if (cfg->tlsCaFile[0] != '\0') {
+    if (SSL_CTX_load_verify_locations(ctx, cfg->tlsCaFile, NULL) != 1) {
+      tlsLogError("SSL_CTX_load_verify_locations");
+      SSL_CTX_free(ctx);
+      return -1;
+    }
+  } else if (!cfg->tlsInsecure) {
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+      tlsLogError("SSL_CTX_set_default_verify_paths");
+      SSL_CTX_free(ctx);
+      return -1;
+    }
+  }
+  if (cfg->tlsCertFile[0] != '\0') {
+    if (SSL_CTX_use_certificate_chain_file(ctx, cfg->tlsCertFile) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, cfg->tlsKeyFile, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ctx) != 1) {
+      tlsLogError("client certificate");
+      SSL_CTX_free(ctx);
+      return -1;
+    }
+  }
+  SSL_CTX_set_verify(ctx, cfg->tlsInsecure ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, NULL);
+
+  SSL *ssl = SSL_new(ctx);
+  if (ssl == NULL) {
+    tlsLogError("SSL_new");
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  const char *name = cfg->tlsServerName[0] != '\0' ? cfg->tlsServerName : cfg->host;
+  if (!isIpLiteral(name) && SSL_set_tlsext_host_name(ssl, name) != 1) {
+    tlsLogError("SSL_set_tlsext_host_name");
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  if (SSL_set_fd(ssl, (int)c->fd) != 1) {
+    tlsLogError("SSL_set_fd");
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  c->tlsCtx = ctx;
+  c->tls = ssl;
+
+  int rc = SSL_connect(ssl);
+  if (rc != 1) {
+    tlsLogError("SSL_connect");
+    return -1;
+  }
+  if (!cfg->tlsInsecure) {
+    long vr = SSL_get_verify_result(ssl);
+    if (vr != X509_V_OK) {
+      msLog(MS_LOG_ERROR, "TLS certificate verification failed: %s",
+            X509_verify_cert_error_string(vr));
+      return -1;
+    }
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    X509 *cert = SSL_get1_peer_certificate(ssl);
+#else
+    X509 *cert = SSL_get_peer_certificate(ssl);
+#endif
+    int match = (cert != NULL && X509_check_host(cert, name, 0, 0, NULL) == 1);
+    if (cert != NULL) X509_free(cert);
+    if (!match) {
+      msLog(MS_LOG_ERROR, "TLS certificate does not match '%s'", name);
+      return -1;
+    }
+  }
+  msLog(MS_LOG_INFO, "TLS established with %s", name);
+  return 0;
+#else
+  (void)c;
+  (void)cfg;
+  msLog(MS_LOG_ERROR, "TLS requested but this build has no TLS support");
+  return -1;
+#endif
+}
+
+/* ---------------- socket I/O ---------------- */
+
+/* Returns: >0 bytes, 0 peer closed, -1 error, -2 retry (WANT_*, EINTR). */
+static int32_t connRecv(SMsConn *c, char *buf, int32_t len) {
+  if (c->tls != NULL) {
+#ifdef MS_WITH_TLS
+    int n = SSL_read((SSL *)c->tls, buf, len);
+    if (n > 0) return n;
+    int e = SSL_get_error((SSL *)c->tls, n);
+    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return -2;
+    if (e == SSL_ERROR_ZERO_RETURN) return 0;
+    return -1;
+#else
+    return -1;
+#endif
+  }
+#ifdef _WIN32
+  int n = recv(c->fd, buf, len, 0);
+  if (n > 0) return n;
+  if (n == 0) return 0;
+  {
+    int err = WSAGetLastError();
+    if (err == WSAEWOULDBLOCK || err == WSAEINTR) return -2;
+  }
+  return -1;
+#else
+  int n = (int)recv(c->fd, buf, (size_t)len, 0);
+  if (n > 0) return n;
+  if (n == 0) return 0;
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+  return -1;
+#endif
+}
+
+static int32_t connPending(SMsConn *c) {
+  if (c->tls == NULL) return 0;
+#ifdef MS_WITH_TLS
+  return SSL_pending((SSL *)c->tls);
+#else
+  return 0;
+#endif
+}
+
+static int32_t waitFd(MsFd fd, bool forWrite, int32_t timeoutMs) {
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(fd, &fds);
+  struct timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (long)(timeoutMs % 1000) * 1000;
+  int sel = forWrite ? select((int)fd + 1, NULL, &fds, NULL, &tv)
+                     : select((int)fd + 1, &fds, NULL, NULL, &tv);
+#ifndef _WIN32
+  if (sel < 0 && errno == EINTR) return 0;
+#endif
+  return sel;
+}
+
 /* Bounded, stop-aware send. EINTR/EAGAIN used to spin forever with no way to
  * honour a stop request; now we wait for writability with a short timeout. */
-static int32_t sendAll(MsFd fd, const char *p, int32_t len, volatile int32_t *stop) {
+static int32_t connSendAll(SMsConn *c, const char *p, int32_t len) {
   int32_t sent = 0;
   int64_t deadline = msNowMs() + MS_SEND_TIMEOUT_MS;
   while (sent < len) {
-    if (stop != NULL && MS_STOPPED(stop)) return -1;
+    if (c->stop != NULL && MS_STOPPED(c->stop)) return -1;
     if (msNowMs() >= deadline) {
       msLog(MS_LOG_WARN, "send timed out after %d byte(s)", sent);
       return -1;
     }
-#ifdef _WIN32
-    int n = send(fd, p + sent, len - sent, 0);
+    if (c->tls != NULL) {
+#ifdef MS_WITH_TLS
+      int n = SSL_write((SSL *)c->tls, p + sent, len - sent);
+      if (n > 0) {
+        sent += n;
+        continue;
+      }
+      int e = SSL_get_error((SSL *)c->tls, n);
+      if (e == SSL_ERROR_WANT_READ) {
+        if (waitFd(c->fd, false, 100) < 0) return -1;
+        continue;
+      }
+      if (e == SSL_ERROR_WANT_WRITE) {
+        if (waitFd(c->fd, true, 100) < 0) return -1;
+        continue;
+      }
+      return -1;
 #else
-    int n = (int)send(fd, p + sent, (size_t)(len - sent), 0);
+      return -1;
+#endif
+    }
+#ifdef _WIN32
+    int n = send(c->fd, p + sent, len - sent, 0);
+#else
+    int n = (int)send(c->fd, p + sent, (size_t)(len - sent), 0);
 #endif
     if (n > 0) {
       sent += n;
@@ -145,19 +379,10 @@ static int32_t sendAll(MsFd fd, const char *p, int32_t len, volatile int32_t *st
 #else
     if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
 #endif
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
     int64_t left = deadline - msNowMs();
     if (left <= 0) return -1;
     if (left > 100) left = 100; /* keep stop responsive */
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = (long)(left * 1000);
-    int sel = select((int)fd + 1, NULL, &wfds, NULL, &tv);
-#ifndef _WIN32
-    if (sel < 0 && errno == EINTR) continue;
-#endif
+    int sel = waitFd(c->fd, true, (int32_t)left);
     if (sel < 0) return -1;
   }
   return 0;
@@ -170,13 +395,14 @@ static int32_t sendPacket(SMsConn *c, uint8_t typeFlags, const char *body, int32
     ssFree(&pkt);
     return -1;
   }
-  int32_t rc = sendAll(c->fd, pkt.data, pkt.len, c->stop);
+  int32_t rc = connSendAll(c, pkt.data, pkt.len);
   ssFree(&pkt);
   if (rc == 0) c->lastSendMs = msNowMs();
   return rc;
 }
 
 static void closeConn(SMsConn *c) {
+  tlsClose(c);
   if (c->fd != MS_BADFD) {
 #ifdef _WIN32
     closesocket(c->fd);
@@ -186,6 +412,20 @@ static void closeConn(SMsConn *c) {
     c->fd = MS_BADFD;
   }
   ssClear(&c->rx);
+}
+
+static void setSocketTimeout(MsFd fd, int32_t ms) {
+#ifdef _WIN32
+  DWORD tv = (DWORD)ms;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#else
+  struct timeval tv;
+  tv.tv_sec = ms / 1000;
+  tv.tv_usec = (ms % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#endif
 }
 
 static int32_t netConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
@@ -262,19 +502,14 @@ static int32_t netConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
   int flags = fcntl(fd, F_GETFL, 0);
   fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 #endif
-#ifdef _WIN32
-  DWORD sndTimeout = 5000;
-  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&sndTimeout, sizeof(sndTimeout));
-#else
-  struct timeval sndTv;
-  sndTv.tv_sec = 5;
-  sndTv.tv_usec = 0;
-  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&sndTv, sizeof(sndTv));
-#endif
+  /* Also covers the TLS handshake, which uses blocking calls. */
+  setSocketTimeout(fd, cfg->connectTimeoutMs > 0 ? cfg->connectTimeoutMs : 5000);
 
   c->fd = fd;
   c->lastSendMs = msNowMs();
   c->lastRecvMs = msNowMs();
+
+  if (cfg->tls && tlsHandshake(c, cfg) != 0) goto fail;
   return 0;
 
 fail:
@@ -283,6 +518,8 @@ fail:
 #else
   close(fd);
 #endif
+  c->fd = MS_BADFD;
+  tlsClose(c);
   return -1;
 }
 
@@ -292,30 +529,66 @@ static uint16_t nextId(SMsConn *c) {
 }
 
 /* QoS2 de-duplication state is only committed after the message has been
- * persisted, is cleared on PUBREL, and is reset on every reconnect. */
-static bool qos2Seen(SMsConn *c, uint16_t id) {
+ * persisted, is cleared on PUBREL, and survives a reconnect while a persistent
+ * session is in use (otherwise packet ids from the old session would alias). */
+static bool qos2Contains(const uint16_t *set, uint16_t id) {
   if (id == 0) return false;
   for (int32_t i = 0; i < 256; ++i) {
-    if (c->qos2Seen[i] == id) return true;
+    if (set[i] == id) return true;
   }
   return false;
 }
 
-static void qos2Remember(SMsConn *c, uint16_t id) {
+static void qos2Insert(uint16_t *set, int32_t *pos, uint16_t id) {
   if (id == 0) return;
-  c->qos2Seen[c->qos2Pos] = id;
-  c->qos2Pos = (c->qos2Pos + 1) % 256;
+  set[*pos] = id;
+  *pos = (*pos + 1) % 256;
 }
 
-static void qos2Forget(SMsConn *c, uint16_t id) {
+static void qos2Remove(uint16_t *set, uint16_t id) {
   for (int32_t i = 0; i < 256; ++i) {
-    if (c->qos2Seen[i] == id) c->qos2Seen[i] = 0;
+    if (set[i] == id) set[i] = 0;
   }
 }
 
-static void qos2Reset(SMsConn *c) {
-  memset(c->qos2Seen, 0, sizeof(c->qos2Seen));
-  c->qos2Pos = 0;
+static bool qos2Seen(SMsConn *c, uint16_t id) { return qos2Contains(c->qos2Seen, id); }
+static void qos2Remember(SMsConn *c, uint16_t id) { qos2Insert(c->qos2Seen, &c->qos2SeenPos, id); }
+static void qos2Forget(SMsConn *c, uint16_t id) { qos2Remove(c->qos2Seen, id); }
+static bool qos2Pending(SMsConn *c, uint16_t id) { return qos2Contains(c->qos2Pending, id); }
+static void qos2PendingAdd(SMsConn *c, uint16_t id) { qos2Insert(c->qos2Pending, &c->qos2PendingPos, id); }
+static void qos2PendingForget(SMsConn *c, uint16_t id) { qos2Remove(c->qos2Pending, id); }
+
+static void qos2Reset(SMsConn *c, bool cleanSession) {
+  memset(c->qos2Pending, 0, sizeof(c->qos2Pending));
+  c->qos2PendingPos = 0;
+  if (cleanSession) {
+    memset(c->qos2Seen, 0, sizeof(c->qos2Seen));
+    c->qos2SeenPos = 0;
+  }
+}
+
+/* Send the ACKs the writer thread has completed. Returns -1 when a batch
+ * failed and the connection must be dropped so the broker redelivers. */
+static int32_t drainAcks(SMsConn *c, const SMsMqttOpts *opts) {
+  if (opts->pollAcks == NULL) return 0;
+  for (;;) {
+    SMsAck acks[16];
+    int32_t n = opts->pollAcks(opts->arg, acks, (int32_t)(sizeof(acks) / sizeof(acks[0])));
+    if (n < 0) return -1;
+    for (int32_t i = 0; i < n; ++i) {
+      uint8_t type = MS_MQTT_PUBACK;
+      if (acks[i].qos == 2) {
+        qos2PendingForget(c, acks[i].packetId);
+        qos2Remember(c, acks[i].packetId);
+        type = MS_MQTT_PUBREC;
+      } else if (acks[i].qos != 1) {
+        continue;
+      }
+      char body[2] = {(char)(acks[i].packetId >> 8), (char)(acks[i].packetId & 0xff)};
+      if (sendPacket(c, (uint8_t)(type << 4), body, 2) != 0) return -1;
+    }
+    if (n < (int32_t)(sizeof(acks) / sizeof(acks[0]))) return 0;
+  }
 }
 
 static int32_t mqttConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
@@ -323,14 +596,19 @@ static int32_t mqttConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
   if (ssInit(&body, 256) != 0) return -1;
 
   uint8_t flags = (uint8_t)(cfg->cleanSession ? 0x02 : 0x00);
-  if (cfg->username[0] != '\0') flags |= 0x80;
-  if (cfg->password[0] != '\0') flags |= 0x40;
+  /* MQTT 3.1.1 3.1.2.9: User Name Flag must be 1 when Password Flag is set. */
+  if (cfg->username[0] != '\0') {
+    flags |= 0x80;
+    if (cfg->password[0] != '\0') flags |= 0x40;
+  }
 
   bool ok = (putStr(&body, "MQTT") == 0 && ssPutChar(&body, (char)4) == 0 &&
              ssPutChar(&body, (char)flags) == 0 && putU16(&body, (uint16_t)cfg->keepalive) == 0 &&
              putStr(&body, cfg->clientId) == 0);
   if (ok && cfg->username[0] != '\0') ok = (putStr(&body, cfg->username) == 0);
-  if (ok && cfg->password[0] != '\0') ok = (putStr(&body, cfg->password) == 0);
+  if (ok && cfg->password[0] != '\0' && cfg->username[0] != '\0') {
+    ok = (putStr(&body, cfg->password) == 0);
+  }
   if (!ok || sendPacket(c, (uint8_t)(MS_MQTT_CONNECT << 4), body.data, body.len) != 0) {
     ssFree(&body);
     return -1;
@@ -340,27 +618,15 @@ static int32_t mqttConnect(SMsConn *c, const SMsBrokerCfg *cfg) {
   /* CONNACK: 0x20 0x02 <flags> <return code> */
   int64_t deadline = msNowMs() + cfg->connectTimeoutMs;
   while (msNowMs() < deadline) {
-    char buf[256];
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(c->fd, &rfds);
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    int sel = select((int)c->fd + 1, &rfds, NULL, NULL, &tv);
+    int sel = waitFd(c->fd, false, 100);
 #ifndef _WIN32
     if (sel < 0 && errno == EINTR) continue;
 #endif
     if (sel < 0) return -1;
     if (sel == 0) continue;
-#ifdef _WIN32
-    int n = recv(c->fd, buf, (int)sizeof(buf), 0);
-#else
-    int n = (int)recv(c->fd, buf, sizeof(buf), 0);
-#endif
-#ifndef _WIN32
-    if (n < 0 && errno == EINTR) continue;
-#endif
+    char buf[256];
+    int n = connRecv(c, buf, (int32_t)sizeof(buf));
+    if (n == -2) continue;
     if (n <= 0) return -1;
     if (ssPut(&c->rx, buf, n) != 0) return -1;
     if (c->rx.len >= 4) {
@@ -441,13 +707,7 @@ static int32_t waitSubAck(SMsConn *c, const SMsMqttOpts *opts) {
   while (!MS_STOPPED(opts->stop) && msNowMs() < deadline) {
     if (c->subAckResult != MS_SUBACK_PENDING) return c->subAckResult;
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(c->fd, &rfds);
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    int sel = select((int)c->fd + 1, &rfds, NULL, NULL, &tv);
+    int sel = waitFd(c->fd, false, 100);
 #ifndef _WIN32
     if (sel < 0 && errno == EINTR) continue;
 #endif
@@ -455,14 +715,8 @@ static int32_t waitSubAck(SMsConn *c, const SMsMqttOpts *opts) {
     if (sel == 0) continue;
 
     char buf[8192];
-#ifdef _WIN32
-    int n = recv(c->fd, buf, (int)sizeof(buf), 0);
-#else
-    int n = (int)recv(c->fd, buf, sizeof(buf), 0);
-#endif
-#ifndef _WIN32
-    if (n < 0 && errno == EINTR) continue;
-#endif
+    int n = connRecv(c, buf, (int32_t)sizeof(buf));
+    if (n == -2) continue;
     if (n <= 0) return -1;
     if (ssPut(&c->rx, buf, n) != 0 || processPackets(c, opts) != 0) return -1;
   }
@@ -501,31 +755,47 @@ static int32_t handlePublish(SMsConn *c, const SMsMqttOpts *opts, uint8_t flags,
     pos += 2;
   }
 
-  bool dup = (qos == 2) ? qos2Seen(c, packetId) : false;
+  if (qos == 2) {
+    if (qos2Seen(c, packetId)) {
+      /* Persisted before the connection dropped: acknowledge again instead of
+       * inserting the redelivered copy a second time. */
+      char rec[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
+      int32_t rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBREC << 4), rec, 2);
+      free(topic);
+      return rc;
+    }
+    /* Same, but the ACK never made it onto the wire before the disconnect. */
+    if (!opts->cfg->cleanSession && opts->wasPersisted != NULL &&
+        opts->wasPersisted(opts->arg, packetId)) {
+      char rec[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
+      qos2Remember(c, packetId);
+      int32_t rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBREC << 4), rec, 2);
+      free(topic);
+      return rc;
+    }
+    if (qos2Pending(c, packetId)) {
+      /* Already queued; its PUBREC follows once the batch is persisted. */
+      free(topic);
+      return 0;
+    }
+  }
+
   int32_t delivered = 0;
-  if (!dup && opts->onMessage != NULL) {
+  if (opts->onMessage != NULL) {
     delivered = opts->onMessage(opts->arg, topic, body + pos, bodyLen - pos, qos,
                                 packetId);
   }
   if (delivered != 0) {
     /* No ACK: force a reconnect so the broker redelivers this PUBLISH. */
-    msLog(MS_LOG_WARN, "message not persisted, withholding QoS ACK (packetId=%u)",
+    msLog(MS_LOG_WARN, "message not queued, withholding QoS ACK (packetId=%u)",
           (unsigned)packetId);
     free(topic);
     return -1;
   }
-  if (qos == 2) qos2Remember(c, packetId);
-
-  int32_t rc = 0;
-  if (qos == 1) {
-    char ack[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
-    rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBACK << 4), ack, 2);
-  } else if (qos == 2) {
-    char rec[2] = {(char)(packetId >> 8), (char)(packetId & 0xff)};
-    rc = sendPacket(c, (uint8_t)(MS_MQTT_PUBREC << 4), rec, 2);
-  }
+  if (qos == 2) qos2PendingAdd(c, packetId);
+  /* QoS1/2 ACKs are sent by drainAcks() after the rows are persisted. */
   free(topic);
-  return rc;
+  return 0;
 }
 
 static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts) {
@@ -553,6 +823,7 @@ static int32_t processPackets(SMsConn *c, const SMsMqttOpts *opts) {
         if (rem >= 2) {
           uint16_t id = (uint16_t)(((uint8_t)body[0] << 8) | (uint8_t)body[1]);
           qos2Forget(c, id); /* QoS2 handshake complete: release the id */
+          if (opts->forgetPersisted != NULL) opts->forgetPersisted(opts->arg, id);
           char comp[2] = {(char)body[0], (char)body[1]};
           rc2 = sendPacket(c, (uint8_t)(MS_MQTT_PUBCOMP << 4), comp, 2);
         }
@@ -613,12 +884,14 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
   }
 
   while (!MS_STOPPED(opts->stop)) {
-    /* A fresh session invalidates QoS2 de-dup state, packet ids and any
-     * pending SUBACK. Old state used to misclassify redelivered messages. */
-    qos2Reset(&conn);
+    /* A fresh session invalidates pending QoS2 state, packet ids and any
+     * SUBACK. Persisted QoS2 ids survive only when the broker keeps the
+     * session (clean_session=false), because packet ids are session-scoped. */
+    qos2Reset(&conn, cfg->cleanSession);
     conn.nextId = 1;
     conn.pendingSubId = 0;
     conn.subAckResult = MS_SUBACK_PENDING;
+    if (opts->pollAcks != NULL) opts->pollAcks(opts->arg, NULL, 0);
 
     if (netConnect(&conn, cfg) != 0 || mqttConnect(&conn, cfg) != 0 ||
         mqttSubscribe(&conn, cfg) != 0 || waitSubAck(&conn, opts) != 0) {
@@ -636,6 +909,12 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
 
     while (!MS_STOPPED(opts->stop)) {
       if (opts->onTick != NULL) opts->onTick(opts->arg);
+      /* ACKs completed by the writer thread; -1 means a batch failed and the
+       * unacknowledged messages must be redelivered on a new connection. */
+      if (drainAcks(&conn, opts) != 0) {
+        msLog(MS_LOG_WARN, "persistence failed, reconnecting to get messages redelivered");
+        break;
+      }
 
       int64_t now = msNowMs();
       if (now - conn.lastSendMs > (int64_t)cfg->keepalive * 800) {
@@ -649,27 +928,26 @@ int32_t msMqttLoop(const SMsMqttOpts *opts) {
         break;
       }
 
-      fd_set rfds;
-      FD_ZERO(&rfds);
-      FD_SET(conn.fd, &rfds);
-      struct timeval tv;
-      tv.tv_sec = 0;
-      tv.tv_usec = 100000; /* 100ms keeps batch flush and stop responsive */
-      int sel = select((int)conn.fd + 1, &rfds, NULL, NULL, &tv);
+      /* TLS keeps decrypted bytes inside OpenSSL: select() would sleep even
+       * though a complete packet is already buffered. */
+      if (connPending(&conn) > 0) {
+        char buf[8192];
+        int n = connRecv(&conn, buf, (int32_t)sizeof(buf));
+        if (n == -2) continue;
+        if (n <= 0) break;
+        if (ssPut(&conn.rx, buf, n) != 0 || processPackets(&conn, opts) != 0) break;
+        continue;
+      }
+
+      int sel = waitFd(conn.fd, false, 100);
 #ifndef _WIN32
       if (sel < 0 && errno == EINTR) continue;
 #endif
       if (sel < 0) break;
       if (sel > 0) {
         char buf[8192];
-#ifdef _WIN32
-        int n = recv(conn.fd, buf, (int)sizeof(buf), 0);
-#else
-        int n = (int)recv(conn.fd, buf, sizeof(buf), 0);
-#endif
-#ifndef _WIN32
-        if (n < 0 && errno == EINTR) continue;
-#endif
+        int n = connRecv(&conn, buf, (int32_t)sizeof(buf));
+        if (n == -2) continue;
         if (n <= 0) break;
         if (ssPut(&conn.rx, buf, n) != 0 || processPackets(&conn, opts) != 0) break;
       }

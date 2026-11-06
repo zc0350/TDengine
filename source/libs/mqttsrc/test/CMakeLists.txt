@@ -37,15 +37,19 @@ target_include_directories(taosmqttsrcDryRun PRIVATE
 )
 target_link_libraries(taosmqttsrcDryRun PRIVATE mqttsrc)
 
-# Register the fake-broker e2e scenarios with CTest so CONNECT/SUBSCRIBE/
-# SUBACK/PUBLISH/PUBACK, QoS1, reconnect and keepalive are actually exercised.
+# Register the fake-broker e2e scenarios with CTest. The broker is a scripted
+# MQTT 3.1.1 server: it validates CONNECT flags, performs the full QoS0/1/2
+# handshake, answers PINGREQ, can drop the connection and redeliver with DUP,
+# and compares the produced rows against the expected set exactly (missing,
+# duplicated and extra rows all fail).
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     set(MS_BROKER "${CMAKE_CURRENT_SOURCE_DIR}/fake_mqtt_broker.py")
     add_test(NAME msE2EDefault
         COMMAND "${Python3_EXECUTABLE}" "${MS_BROKER}"
                 "$<TARGET_FILE:taosmqttsrcDryRun>"
-                "${MS_CONF_DIR}/mqttsrc.example.json")
+                "${MS_CONF_DIR}/mqttsrc.example.json"
+                "${CMAKE_CURRENT_SOURCE_DIR}/e2e_default_scenario.json")
     add_test(NAME msE2EDevice
         COMMAND "${Python3_EXECUTABLE}" "${MS_BROKER}"
                 "$<TARGET_FILE:taosmqttsrcDryRun>"
@@ -56,7 +60,12 @@ if(Python3_Interpreter_FOUND)
                 "$<TARGET_FILE:taosmqttsrcDryRun>"
                 "${MS_CONF_DIR}/mqttsrc.rules.example.json"
                 "${CMAKE_CURRENT_SOURCE_DIR}/e2e_rules_scenario.json")
-    foreach(_e2e msE2EDefault msE2EDevice msE2ERules)
+    add_test(NAME msE2EReconnect
+        COMMAND "${Python3_EXECUTABLE}" "${MS_BROKER}"
+                "$<TARGET_FILE:taosmqttsrcDryRun>"
+                "${MS_CONF_DIR}/mqttsrc.example.json"
+                "${CMAKE_CURRENT_SOURCE_DIR}/e2e_reconnect_scenario.json")
+    foreach(_e2e msE2EDefault msE2EDevice msE2ERules msE2EReconnect)
         set_tests_properties(${_e2e} PROPERTIES TIMEOUT 60)
     endforeach()
 else()

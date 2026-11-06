@@ -32,6 +32,10 @@ extern "C" {
 #define MS_TEXT_LEN     256
 #define MS_PATH_LEN     256
 #define MS_ERR_LEN      512
+/* Upper bound for a single JSON scalar lifted into a template or a column.
+ * Values longer than this are rejected (never silently truncated), so a
+ * VARCHAR column cannot lose its tail without the operator noticing. */
+#define MS_VALUE_LEN    1024
 
 /* Timestamp precision of the incoming JSON timestamp field. */
 typedef enum {
@@ -68,6 +72,14 @@ typedef struct {
   int      reconnectMs;     /* initial backoff */
   int      maxReconnectMs;  /* backoff cap */
   int      connectTimeoutMs;
+  /* TLS. A build without TLS support refuses these settings instead of
+   * silently sending credentials in clear text. */
+  bool     tls;
+  bool     tlsInsecure;     /* skip certificate and host name verification */
+  char     tlsCaFile[MS_PATH_LEN];
+  char     tlsCertFile[MS_PATH_LEN];
+  char     tlsKeyFile[MS_PATH_LEN];
+  char     tlsServerName[MS_NAME_LEN]; /* SNI / verification name, default host */
   SMsTopic topics[MS_MAX_TOPICS];
   int      topicNum;
   /* One name per topic level; "_" ignores that level. Bound to {name}. */
@@ -88,6 +100,10 @@ typedef struct {
   int      retryMs;
   int32_t  ttl;           /* 0 => server default */
   bool     dryRun;        /* print line protocol instead of writing */
+  /* Bounded queue between the MQTT reader and the writer thread. A full
+   * queue applies backpressure (and finally a reconnect) instead of growing
+   * without limit. */
+  int      queueSize;
 } SMsSinkCfg;
 
 typedef struct {
@@ -154,6 +170,8 @@ typedef struct {
   SMsBrokerCfg  broker;
   SMsSinkCfg    sink;
   SMsMappingCfg mapping;
+  /* Periodic stats line on stderr. 0 disables it; default 60000. */
+  int           statsIntervalMs;
 } SMsCfg;
 
 typedef struct {
@@ -165,6 +183,9 @@ typedef struct {
   uint64_t parseErrors; /* malformed JSON / missing fields */
   uint64_t reconnects;
   uint64_t flushes;
+  uint64_t queued;      /* messages accepted into the write queue */
+  uint64_t acksDeferred;/* QoS1/2 ACKs sent only after persistence */
+  uint64_t maxQueueDepth;
 } SMsStats;
 
 typedef struct SMsSrc SMsSrc; /* opaque runtime handle */
@@ -178,7 +199,11 @@ int32_t msLoadConfig(const char *path, SMsCfg *cfg, char *err, int32_t errLen);
 /* Validate a config. Returns 0 on success, -1 on failure (err is set). */
 int32_t msValidateConfig(const SMsCfg *cfg, char *err, int32_t errLen);
 
-/* Start the ingestion loop in the caller's thread (blocks until stopped). */
+/* Start the ingestion loop in the caller's thread (blocks until stopped).
+ * On a startup failure (invalid config, sink unavailable, thread error) -1 is
+ * returned and *ppSrc is NULL. Once the loop has started *ppSrc stays valid
+ * even when -1 is returned at shutdown (lost rows); release it with
+ * msSrcFree(). */
 int32_t msSrcRun(const SMsCfg *cfg, SMsSrc **ppSrc);
 
 /* Request a graceful stop. The stop flag uses an atomic store, so this is safe

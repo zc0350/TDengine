@@ -1,0 +1,20 @@
+{
+  "_comment": "重连场景：第一条 QoS2 消息落库失败前（未回 PUBREC）强行断链，客户端重连后 Broker 以 DUP=1 重投。要求最终只有一行输出，验证批量确认 + QoS2 去重 + 重连后不重复落库。",
+  "topic": "factory/bj/telemetry",
+  "clean_session": false,
+  "ping": true,
+  "batch_size": 2,
+  "flush_ms": 40,
+  "run_ms": 4000,
+  "drop_after": 0,
+  "redeliver": true,
+  "qos": [2, 1],
+  "payloads": [
+    {"ts": 1730000000100, "dev": "r1", "current": 1, "voltage": 2, "running": true, "note": "a"},
+    {"ts": 1730000000101, "dev": "r2", "current": 3, "voltage": 4, "running": false, "note": "b"}
+  ],
+  "expected": [
+    "meters,device=r1,site=bj,tbname=t_r1_bj current=1,voltage=2,running=true,note=\"a\" 1730000000100",
+    "meters,device=r2,site=bj,tbname=t_r2_bj current=3,voltage=4,running=false,note=\"b\" 1730000000101"
+  ]
+}

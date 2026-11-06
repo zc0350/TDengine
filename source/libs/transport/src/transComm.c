@@ -253,6 +253,9 @@ int32_t transDecompressMsg(char** msg, int32_t* len) {
 
   *len = oriLen + sizeof(STransMsgHead);
   pNewHead->msgLen = htonl(oriLen + sizeof(STransMsgHead));
+  /* The buffer is no longer compressed. Matches transDecompressMsgExt();
+   * leaving the flag set made the header lie about its payload. */
+  pNewHead->comp = 0;
 
   taosMemoryFree(pHead);
   *msg = buf;

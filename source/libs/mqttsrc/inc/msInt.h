@@ -46,14 +46,46 @@ extern "C" {
 #if defined(_MSC_VER)
 #define MS_ATOMIC_STORE(p, v) _InterlockedExchange((volatile long *)(p), (long)(v))
 #define MS_ATOMIC_LOAD(p)     _InterlockedCompareExchange((volatile long *)(p), 0, 0)
+#define MS_PTR_STORE(p, v)    ((void)_InterlockedExchangePointer((void *volatile *)(p), (void *)(v)))
+#define MS_PTR_LOAD(p)        _InterlockedCompareExchangePointer((void *volatile *)(p), NULL, NULL)
 #elif defined(__GNUC__) || defined(__clang__)
 #define MS_ATOMIC_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
 #define MS_ATOMIC_LOAD(p)     __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define MS_PTR_STORE(p, v)    __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define MS_PTR_LOAD(p)        __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #else
 #define MS_ATOMIC_STORE(p, v) (*(p) = (v))
 #define MS_ATOMIC_LOAD(p)     (*(p))
+#define MS_PTR_STORE(p, v)    (*(p) = (v))
+#define MS_PTR_LOAD(p)        (*(p))
 #endif
 #define MS_STOPPED(stop)      (MS_ATOMIC_LOAD(stop) != 0)
+
+/* ---------------- threads ---------------- */
+#ifdef _WIN32
+typedef CRITICAL_SECTION MsMutex;
+typedef HANDLE           MsCond;
+typedef HANDLE           MsThread;
+#else
+#include <pthread.h>
+typedef pthread_mutex_t MsMutex;
+typedef pthread_cond_t  MsCond;
+typedef pthread_t       MsThread;
+#endif
+
+void msMutexInit(MsMutex *m);
+void msMutexDestroy(MsMutex *m);
+void msMutexLock(MsMutex *m);
+void msMutexUnlock(MsMutex *m);
+void msCondInit(MsCond *c);
+void msCondDestroy(MsCond *c);
+/* Both waits release the mutex while blocked and reacquire it on return. */
+void msCondWait(MsCond *c, MsMutex *m);
+void msCondWaitMs(MsCond *c, MsMutex *m, int32_t ms);
+void msCondSignal(MsCond *c);
+void msCondBroadcast(MsCond *c);
+int32_t msThreadStart(MsThread *t, void *(*fn)(void *), void *arg);
+void msThreadJoin(MsThread t);
 
 #define MS_LOG_DEBUG 0
 #define MS_LOG_INFO  1
@@ -105,11 +137,21 @@ int32_t msRender(const char *tpl, MsLookup lookup, void *arg, SStr *out);
 
 typedef struct {
   int32_t type;
-  char    text[MS_TEXT_LEN];
+  int32_t truncated; /* 1 when the source value did not fit MS_VALUE_LEN */
+  char    text[MS_VALUE_LEN];
 } SMsValue;
 
 /* Dot separated path lookup. Returns 0 on success, -1 when absent. */
 int32_t msJsonPath(tools_cJSON *root, const char *path, SMsValue *val);
+
+/* ---------------- template syntax validation ---------------- */
+/* Rejects unbalanced/empty placeholders, invalid key characters and unknown
+ * "_"-prefixed builtins. vars[] lists the configured topic_vars (may be NULL).
+ * Returns 0 when the template can only fail at runtime because of payload
+ * data, -1 (with err set) for a configuration error. */
+int32_t msValidateTemplate(const char *tpl, const char *what,
+                           const char (*vars)[MS_NAME_LEN], int32_t varNum,
+                           char *err, int32_t errLen);
 
 /* ---------------- MQTT client ---------------- */
 /* Return 0 when the message is durably accepted, non-zero when it must NOT
@@ -119,11 +161,29 @@ typedef int32_t (*MsMsgCb)(void *arg, const char *topic, const uint8_t *payload,
                            int32_t len, int32_t qos, int32_t packetId);
 typedef void (*MsTickCb)(void *arg);
 
+/* A persistence completion reported back to the MQTT thread. The ACK is sent
+ * from that thread, so all socket I/O stays single threaded. */
+typedef struct {
+  uint16_t packetId;
+  uint8_t  qos;
+} SMsAck;
+
+/* Collect completed messages. max == 0 discards pending entries (used when
+ * the session is reset). Returns the number of entries written, or -1 when a
+ * batch failed and the connection must be dropped so the broker redelivers. */
+typedef int32_t (*MsAckPoll)(void *arg, SMsAck *acks, int32_t max);
+
 typedef struct {
   const SMsBrokerCfg *cfg;
   volatile int32_t   *stop;
   MsMsgCb             onMessage;
   MsTickCb            onTick;
+  MsAckPoll           pollAcks;
+  /* QoS2 exactly-once across a resumed session: "was this id persisted
+   * already?" is consulted when the broker redelivers after a reconnect, and
+   * the id is forgotten once PUBREL completes the handshake. */
+  int32_t (*wasPersisted)(void *arg, uint16_t packetId);
+  void    (*forgetPersisted)(void *arg, uint16_t packetId);
   void               *arg;
   uint64_t           *reconnects;
 } SMsMqttOpts;
@@ -141,6 +201,9 @@ void    msSinkClose(SMsSink *sink);
 /* ---------------- misc ---------------- */
 int32_t msStrToInt(const char *p, int32_t def);
 void    msStrCopy(char *dst, int32_t cap, const char *src);
+/* "<prefix>-<hostname>-<pid>" truncated into buf; used as the default MQTT
+ * client id so two instances on the same broker cannot evict each other. */
+void    msDefaultClientId(char *buf, int32_t cap);
 
 #ifdef __cplusplus
 }

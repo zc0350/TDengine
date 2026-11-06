@@ -164,6 +164,8 @@ static int32_t lookup(void *arg, const char *key, char *buf, int32_t bufLen) {
   }
   SMsValue v;
   if (msJsonPath(ctx->rec, key, &v) != 0 || v.type == MSV_NULL) return -1;
+  /* A shortened value would silently corrupt a tag or a column. */
+  if (v.truncated) return -1;
   snprintf(buf, (size_t)bufLen, "%s", v.text);
   return 0;
 }
@@ -186,7 +188,7 @@ static bool inList(const char *list, const char *val) {
 }
 
 static bool whenMatch(const SMsWhen *w, SMsCtx *ctx) {
-  char val[MS_TEXT_LEN];
+  char val[MS_VALUE_LEN];
   bool exists = (lookup(ctx, w->path, val, sizeof(val)) == 0);
   if (w->op == MS_WHEN_EXISTS) return exists;
   if (!exists) return false;
@@ -291,6 +293,11 @@ static int32_t renderTs(const SMsCtx *ctx, int64_t *ts, char *err, int32_t errLe
 static int32_t appendValue(SStr *line, const SMsColumn *col, const SMsValue *v,
                            char *err, int32_t errLen) {
   int32_t type = col->type;
+  if (v->truncated) {
+    setErr(err, errLen, "column '%s' value exceeds %d bytes", col->name,
+           MS_VALUE_LEN - 1);
+    return -1;
+  }
   if (type == MS_COL_AUTO) {
     switch (v->type) {
       case MSV_INT:    /* plain numeric => DOUBLE, keeps int/float type-stable */
@@ -408,7 +415,13 @@ static int32_t mapRecord(SMsCtx *ctx, SStr *out, char *err, int32_t errLen) {
     return -1;
   }
   char tableNameZ[MS_NAME_LEN];
-  snprintf(tableNameZ, sizeof(tableNameZ), "%s", tableName.data ? tableName.data : "");
+  if (tableName.data == NULL || strlen(tableName.data) >= sizeof(tableNameZ)) {
+    setErr(err, errLen, "rendered table name exceeds %d bytes", (int)sizeof(tableNameZ) - 1);
+    ssFree(&tableName);
+    ssFree(&line);
+    return -1;
+  }
+  snprintf(tableNameZ, sizeof(tableNameZ), "%s", tableName.data);
   ssFree(&tableName);
   if (tableNameZ[0] == '\0') {
     setErr(err, errLen, "rendered table name is empty");

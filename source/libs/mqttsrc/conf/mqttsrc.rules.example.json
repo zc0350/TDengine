@@ -1,9 +1,11 @@
 {
+  "stats_interval_ms": 60000,
   "mqtt": {
     "host": "127.0.0.1",
     "port": 1883,
     "client_id": "taosx-mqttsrc-rules",
     "keepalive": 60,
+    "clean_session": false,
     "topics": [
       { "filter": "factory/+/telemetry", "qos": 1 }
     ],
@@ -18,6 +20,7 @@
     "create_db": true,
     "batch_size": 1000,
     "flush_ms": 200,
+    "queue_size": 10000,
     "dry_run": false
   },
   "mapping": {
@@ -89,8 +92,8 @@
           { "name": "up", "path": "up", "type": "bool" }
         ],
         "tags": [
-          { "name": "dev",          "value": "{dev}" },
-          { "name": "server_year",  "value": "{_server_year}" }
+          { "name": "dev",         "value": "{dev}" },
+          { "name": "server_year", "value": "{_server_year}" }
         ]
       }
     ]
