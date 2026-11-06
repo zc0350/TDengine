@@ -89,7 +89,21 @@ jobs:
       # msE2EReconnect. The e2e set drives the dry-run binary against a scripted
       # MQTT 3.1.1 broker, so the whole publish is gated on protocol behaviour.
       - name: Run mqttsrc tests
-        run: ctest --test-dir debug -C Release --output-on-failure -R '^ms'
+        run: |
+          set -o pipefail
+          ctest --test-dir debug -C Release --output-on-failure -R '^ms' 2>&1 | tee test.log
+
+      - name: Summarise test failures
+        if: failure()
+        run: |
+          LOG=test.log
+          [ -f "${LOG}" ] || exit 0
+          tail -45 "${LOG}" > /tmp/errs.txt
+          awk '{gsub(/%/,"%25"); gsub(/\r/,""); printf "%s%%0A", substr($0,1,300)}' \
+            /tmp/errs.txt > /tmp/msg.txt
+          if [ -s /tmp/msg.txt ]; then
+            echo "::error::$(cat /tmp/msg.txt)"
+          fi
 
       - name: Package relocatable bundle
         run: |
