@@ -61,8 +61,25 @@ jobs:
 
       - name: Build taosmqttsrc and its tests
         run: |
+          set -o pipefail
           ./build.sh bld --target \
-            taosmqttsrc taosmqttsrcDryRun msUnitTest msSinkTest
+            taosmqttsrc taosmqttsrcDryRun msUnitTest msSinkTest 2>&1 | tee build.log
+
+      # Turn compiler diagnostics into check-run annotations: a failed build is
+      # otherwise invisible from the API and from a fork's public Actions page.
+      - name: Summarise build errors
+        if: failure()
+        run: |
+          LOG=build.log
+          [ -f "${LOG}" ] || exit 0
+          {
+            grep -nE 'error:|CMake Error|undefined reference|No rule to make target|fatal error' "${LOG}" || true
+            echo '---'
+            tail -25 "${LOG}"
+          } | head -30 | while IFS= read -r line; do
+            esc=$(printf '%s' "${line}" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')
+            echo "::error::${esc}"
+          done
 
       # msUnitTest / msSinkTest / msE2EDefault / msE2EDevice / msE2ERules /
       # msE2EReconnect. The e2e set drives the dry-run binary against a scripted
@@ -168,7 +185,7 @@ jobs:
           retention-days: 30
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-rc')
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
