@@ -73,13 +73,17 @@ jobs:
           LOG=build.log
           [ -f "${LOG}" ] || exit 0
           {
-            grep -nE 'error:|CMake Error|undefined reference|No rule to make target|fatal error' "${LOG}" || true
-            echo '---'
-            tail -25 "${LOG}"
-          } | head -30 | while IFS= read -r line; do
-            esc=$(printf '%s' "${line}" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')
-            echo "::error::${esc}"
-          done
+            grep -hE '([Ee]rror|warning):' "${LOG}" | head -20 || true
+            echo '~~~~~~ last lines ~~~~~~'
+            tail -8 "${LOG}"
+          } > /tmp/errs.txt
+          # One annotation, newlines encoded as %0A (percent first, or the
+          # escaping would eat its own output).
+          awk '{gsub(/%/,"%25"); gsub(/\r/,""); printf "%s%%0A", substr($0,1,300)}' \
+            /tmp/errs.txt > /tmp/msg.txt
+          if [ -s /tmp/msg.txt ]; then
+            echo "::error::$(cat /tmp/msg.txt)"
+          fi
 
       # msUnitTest / msSinkTest / msE2EDefault / msE2EDevice / msE2ERules /
       # msE2EReconnect. The e2e set drives the dry-run binary against a scripted

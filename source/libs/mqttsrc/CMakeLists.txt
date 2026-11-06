@@ -48,6 +48,9 @@ if(TD_WINDOWS)
 endif()
 
 add_executable(taosmqttsrc src/msMain.c)
+# msMain.c drives the internal SMsSrc API from inc/, which mqttsrc keeps
+# PRIVATE so it does not leak into the public header surface.
+target_include_directories(taosmqttsrc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/inc")
 target_link_libraries(taosmqttsrc PRIVATE mqttsrc ${TAOS_LIB})
 
 # libtaos is installed in ../driver with an @rpath install name on macOS;
