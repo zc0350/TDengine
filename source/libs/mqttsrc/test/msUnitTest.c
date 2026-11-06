@@ -424,7 +424,15 @@ static void testConfigValidation(void) {
   CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1, "queue_size 0 rejected");
   cfg.sink.queueSize = 100;
   cfg.broker.tls = true;
-#ifndef MS_WITH_TLS
+#ifdef MS_WITH_TLS
+  /* A TLS-capable build must accept the request; the cert/key pairing rule is
+   * covered by the config-loader cases below. */
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == 0, err);
+  snprintf(cfg.broker.tlsCertFile, MS_PATH_LEN, "%s", "/tmp/client.pem");
+  CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1,
+        "client certificate without a key rejected");
+  snprintf(cfg.broker.tlsCertFile, MS_PATH_LEN, "%s", "");
+#else
   CHECK(msValidateConfig(&cfg, err, sizeof(err)) == -1,
         "TLS request rejected by a build without TLS");
 #endif

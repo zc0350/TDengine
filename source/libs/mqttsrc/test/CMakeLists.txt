@@ -11,6 +11,12 @@ target_compile_definitions(msUnitTest PRIVATE
     MS_TEST_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../conf/mqttsrc.example.json"
     MS_TEST_RULES_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/../conf/mqttsrc.rules.example.json"
 )
+# MS_WITH_TLS is PRIVATE to the library, but the config-validation cases differ
+# by build: a TLS-less build has to reject "tls.enabled", a TLS build must
+# accept it. Keep the test in step with the library it links against.
+if(MQTTSRC_ENABLE_TLS)
+    target_compile_definitions(msUnitTest PRIVATE MS_WITH_TLS=1)
+endif()
 add_test(
     NAME msUnitTest
     COMMAND msUnitTest
