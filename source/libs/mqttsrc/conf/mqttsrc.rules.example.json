@@ -1,0 +1,98 @@
+{
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "client_id": "taosx-mqttsrc-rules",
+    "keepalive": 60,
+    "topics": [
+      { "filter": "factory/+/telemetry", "qos": 1 }
+    ],
+    "topic_vars": ["_", "site", "_"]
+  },
+  "tdengine": {
+    "host": "127.0.0.1",
+    "port": 6030,
+    "user": "root",
+    "password": "taosdata",
+    "database": "mqtt_rules",
+    "create_db": true,
+    "batch_size": 1000,
+    "flush_ms": 200,
+    "dry_run": false
+  },
+  "mapping": {
+    "stable": "generic",
+    "table": "t_{dev}_{site}",
+    "tbname_key": "tbname",
+    "ts_field": "ts",
+    "ts_precision": "ms",
+    "columns": [
+      { "name": "value", "path": "value", "type": "number" }
+    ],
+    "tags": [
+      { "name": "dev",  "value": "{dev}" },
+      { "name": "site", "value": "{site}" }
+    ],
+    "rules": [
+      {
+        "name": "temperature",
+        "when": [ { "path": "type", "op": "eq", "value": "temperature" } ],
+        "stable": "sensor_{site}",
+        "table": "t_{dev}",
+        "columns": [
+          { "name": "temp", "path": "temp", "type": "number" },
+          { "name": "unit", "path": "unit", "type": "string" }
+        ],
+        "tags": [
+          { "name": "dev",  "value": "{dev}" },
+          { "name": "site", "value": "{site}" },
+          { "name": "kind", "value": "{type}" }
+        ]
+      },
+      {
+        "name": "power",
+        "when": [ { "path": "type", "op": "in", "value": "power,energy" } ],
+        "stable": "power_{site}",
+        "table": "t_{dev}",
+        "columns": [
+          { "name": "kw", "path": "kw", "type": "number" },
+          { "name": "on", "path": "on", "type": "bool" }
+        ],
+        "tags": [
+          { "name": "dev",  "value": "{dev}" },
+          { "name": "line", "value": "{line}" }
+        ]
+      },
+      {
+        "_comment": "按消息时间戳年份分表：{_year}/{_month}/{_day} 来自该行最终落库的 ts（ts_field 或接收时间），本地时区。跨年自动开新表，无需新增规则。",
+        "name": "archive_by_msg_year",
+        "when": [ { "path": "type", "op": "eq", "value": "archive" } ],
+        "stable": "archive_{_year}",
+        "table": "t_{dev}_{_year}{_month}",
+        "columns": [
+          { "name": "value", "path": "value", "type": "number" },
+          { "name": "level", "path": "level", "type": "string" }
+        ],
+        "tags": [
+          { "name": "dev",   "value": "{dev}" },
+          { "name": "year",  "value": "{_year}" },
+          { "name": "month", "value": "{_month}" }
+        ]
+      },
+      {
+        "_comment": "按服务器年份分表：{_server_year} 取接收时刻（服务器时钟），不受设备时间戳漂移影响。适合归档以服务端时间为准的场景。",
+        "name": "server_year_partition",
+        "when": [ { "path": "type", "op": "eq", "value": "heartbeat" } ],
+        "stable": "srv_{_server_year}_{site}",
+        "table": "t_{dev}_{_server_year}",
+        "columns": [
+          { "name": "up", "path": "up", "type": "bool" }
+        ],
+        "tags": [
+          { "name": "dev",          "value": "{dev}" },
+          { "name": "server_year",  "value": "{_server_year}" }
+        ]
+      }
+    ]
+  }
+}

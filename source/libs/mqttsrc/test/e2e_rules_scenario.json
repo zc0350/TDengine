@@ -1,0 +1,18 @@
+{
+  "topic": "factory/bj/telemetry",
+  "qos": [0, 1, 0, 0, 1],
+  "payloads": [
+    {"type": "temperature", "dev": "d1", "ts": 1730000000000, "temp": 23.5, "unit": "C"},
+    {"type": "power", "dev": "p1", "ts": 1730000000001, "kw": 12, "on": true, "line": "L1"},
+    {"type": "unknown", "dev": "x1", "ts": 1730000000002, "value": 7},
+    {"type": "archive", "dev": "a1", "ts": 1793936226000, "value": 42, "level": "warn"},
+    {"type": "heartbeat", "dev": "h1", "ts": 1793936226001, "up": true}
+  ],
+  "expected": [
+    "sensor_bj,dev=d1,site=bj,kind=temperature,tbname=t_d1 temp=23.5,unit=\"C\" 1730000000000",
+    "power_bj,dev=p1,line=L1,tbname=t_p1 kw=12,on=true 1730000000001",
+    "generic,dev=x1,site=bj,tbname=t_x1_bj value=7 1730000000002",
+    "archive_2026,dev=a1,year=2026,month=11,tbname=t_a1_202611 value=42,level=\"warn\" 1793936226000",
+    "srv_{server_year}_bj,dev=h1,server_year={server_year},tbname=t_h1_{server_year} up=true 1793936226001"
+  ]
+}

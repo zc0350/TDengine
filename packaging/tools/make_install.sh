@@ -196,6 +196,7 @@ function install_bin() {
   ${csudo}rm -f ${bin_link_dir}/taosBenchmark || :
   ${csudo}rm -f ${bin_link_dir}/taosdump || :
   ${csudo}rm -f ${bin_link_dir}/taosmqtt || :
+  ${csudo}rm -f ${bin_link_dir}/taosmqttsrc || :
   
   ${csudo}rm -f ${bin_link_dir}/${uninstallScript} || :
 
@@ -211,6 +212,7 @@ function install_bin() {
     [ -f ${binary_dir}/build/bin/taosk ] && ${csudo}cp -r ${binary_dir}/build/bin/taosk ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosudf ] && ${csudo}cp -r ${binary_dir}/build/bin/taosudf ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosmqtt ] && ${csudo}cp -r ${binary_dir}/build/bin/taosmqtt ${install_main_dir}/bin || :
+    [ -f ${binary_dir}/build/bin/taosmqttsrc ] && ${csudo}cp -r ${binary_dir}/build/bin/taosmqttsrc ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosx ] && ${csudo}cp -r ${binary_dir}/build/bin/taosx ${install_main_dir}/bin || :
     ${csudo}cp -r ${binary_dir}/build/bin/${serverName} ${install_main_dir}/bin || :
 
@@ -228,6 +230,7 @@ function install_bin() {
     [ -x ${install_main_dir}/bin/taosk ] && ${csudo}ln -s ${install_main_dir}/bin/taosk ${bin_link_dir}/taosk > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosudf ] && ${csudo}ln -s ${install_main_dir}/bin/taosudf ${bin_link_dir}/taosudf > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosmqtt ] && ${csudo}ln -s ${install_main_dir}/bin/taosmqtt ${bin_link_dir}/taosmqtt > /dev/null 2>&1 || :
+    [ -x ${install_main_dir}/bin/taosmqttsrc ] && ${csudo}ln -s ${install_main_dir}/bin/taosmqttsrc ${bin_link_dir}/taosmqttsrc > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosdump ] && ${csudo}ln -s ${install_main_dir}/bin/taosdump ${bin_link_dir}/taosdump > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosBenchmark ] && ${csudo}ln -s ${install_main_dir}/bin/taosBenchmark ${bin_link_dir}/taosBenchmark > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosx ] && ${csudo}ln -s ${install_main_dir}/bin/taosx ${bin_link_dir}/taosx > /dev/null 2>&1 || :
@@ -244,6 +247,7 @@ function install_bin() {
     [ -f ${binary_dir}/build/bin/taosk ] && ${csudo}cp -r ${binary_dir}/build/bin/taosk ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosudf ] && ${csudo}cp -r ${binary_dir}/build/bin/taosudf ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosmqtt ] && ${csudo}cp -r ${binary_dir}/build/bin/taosmqtt ${install_main_dir}/bin || :
+    [ -f ${binary_dir}/build/bin/taosmqttsrc ] && ${csudo}cp -r ${binary_dir}/build/bin/taosmqttsrc ${install_main_dir}/bin || :
     [ -f ${binary_dir}/build/bin/taosx ] && ${csudo}cp -r ${binary_dir}/build/bin/taosx ${install_main_dir}/bin || :
       # Check if explorer files exist using ls instead of -f with glob
       if ls ${binary_dir}/build/bin/*explorer > /dev/null 2>&1; then
@@ -261,6 +265,7 @@ function install_bin() {
     [ -x ${install_main_dir}/bin/taosk ] && ${csudo}ln -s ${install_main_dir}/bin/taosk ${bin_link_dir}/taosk > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosudf ] && ${csudo}ln -s ${install_main_dir}/bin/taosudf ${bin_link_dir}/taosudf > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosmqtt ] && ${csudo}ln -s ${install_main_dir}/bin/taosmqtt ${bin_link_dir}/taosmqtt > /dev/null 2>&1 || :
+    [ -x ${install_main_dir}/bin/taosmqttsrc ] && ${csudo}ln -s ${install_main_dir}/bin/taosmqttsrc ${bin_link_dir}/taosmqttsrc > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosdump ] && ${csudo}ln -s ${install_main_dir}/bin/taosdump ${bin_link_dir}/taosdump > /dev/null 2>&1 || :
     [ -f ${install_main_dir}/bin/taosBenchmark ] && ${csudo}ln -sf ${install_main_dir}/bin/taosBenchmark ${bin_link_dir}/taosBenchmark > /dev/null 2>&1 || :
     [ -x ${install_main_dir}/bin/taosx ] && ${csudo}ln -s ${install_main_dir}/bin/taosx ${bin_link_dir}/taosx > /dev/null 2>&1 || :

@@ -139,6 +139,7 @@ if /I "%Enterprise%"=="TRUE" (
 copy %binary_dir%\\build\\bin\\taosd.exe %target_dir% > nul
 copy %binary_dir%\\build\\bin\\taosudf.exe %target_dir% > nul
 copy %binary_dir%\\build\\bin\\taosmqtt.exe %target_dir% > nul
+copy %binary_dir%\\build\\bin\\taosmqttsrc.exe %target_dir% > nul
 
 rem // ── Federated-query dependency package ──────────────────────────────────
 rem //   When INSTALL_FQ_RUNTIME_LIBS is ON the build stages the provider

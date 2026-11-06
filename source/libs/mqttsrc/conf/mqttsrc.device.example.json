@@ -1,0 +1,41 @@
+{
+  "_comment": "设备上报消息映射：event/deviceCode/imei 作为普通列，完整 payload 写入 data 列。time 是秒级时间戳。alarms 消息没有 imei，该列用 auto 类型让缺失时自动省略（落库为 NULL）。",
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "client_id": "taosx-device-ingest",
+    "keepalive": 60,
+    "topics": [
+      { "filter": "device/+/up", "qos": 1 }
+    ]
+  },
+  "tdengine": {
+    "host": "127.0.0.1",
+    "port": 6030,
+    "user": "root",
+    "password": "taosdata",
+    "database": "device_msgs",
+    "create_db": true,
+    "batch_size": 500,
+    "flush_ms": 200,
+    "dry_run": false
+  },
+  "mapping": {
+    "_comment": "$payload = 当前这条 JSON 记录（数组消息按行拆分）；若要把整条 MQTT 消息原文（含数组）存进 data，改成 $message。door_num 数组可用 path \"door_num.0\" 取首个元素。",
+    "stable": "device_events_{_year}",
+    "table": "t_{deviceCode}",
+    "tbname_key": "tbname",
+    "ts_field": "time",
+    "ts_precision": "s",
+    "columns": [
+      { "name": "event",       "path": "event",       "type": "string" },
+      { "name": "device_code", "path": "deviceCode",  "type": "string" },
+      { "name": "imei",        "path": "imei" },
+      { "name": "data",        "path": "$payload",    "type": "string" }
+    ],
+    "tags": [
+      { "name": "device", "value": "{deviceCode}" },
+      { "name": "year",   "value": "{_year}" }
+    ]
+  }
+}

@@ -279,6 +279,7 @@ function install_bin() {
     ${csudo}rm -f ${bin_link_dir}/taosk    || :
     ${csudo}rm -f ${bin_link_dir}/taosudf  || :
     ${csudo}rm -f ${bin_link_dir}/taosmqtt || :
+    ${csudo}rm -f ${bin_link_dir}/taosmqttsrc || :
     ${csudo}rm -f ${bin_link_dir}/taosadapter     || :
     ${csudo}rm -f ${bin_link_dir}/taosBenchmark || :
     ${csudo}rm -f ${bin_link_dir}/taoskeeper || :
@@ -309,6 +310,9 @@ function install_bin() {
     fi
     if [ -x ${bin_dir}/taosmqtt ]; then
       ${csudo}ln -s ${bin_dir}/taosmqtt ${bin_link_dir}/taosmqtt             2>>${install_log_path} || return 1
+    fi
+    if [ -x ${bin_dir}/taosmqttsrc ]; then
+      ${csudo}ln -s ${bin_dir}/taosmqttsrc ${bin_link_dir}/taosmqttsrc       2>>${install_log_path} || return 1
     fi
     if [ -x ${bin_dir}/taosadapter ]; then
       ${csudo}ln -s ${bin_dir}/taosadapter ${bin_link_dir}/taosadapter       2>>${install_log_path} || return 1

@@ -1,0 +1,49 @@
+{
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "client_id": "taosx-mqttsrc-demo",
+    "username": "",
+    "password": "",
+    "keepalive": 60,
+    "clean_session": true,
+    "reconnect_ms": 1000,
+    "max_reconnect_ms": 30000,
+    "connect_timeout_ms": 5000,
+    "topics": [
+      { "filter": "factory/+/telemetry", "qos": 1 }
+    ],
+    "topic_vars": ["_", "site", "_"]
+  },
+  "tdengine": {
+    "host": "127.0.0.1",
+    "port": 6030,
+    "user": "root",
+    "password": "taosdata",
+    "database": "mqtt_demo",
+    "create_db": true,
+    "batch_size": 1000,
+    "flush_ms": 200,
+    "max_retries": 3,
+    "retry_ms": 500,
+    "ttl": 0,
+    "dry_run": false
+  },
+  "mapping": {
+    "stable": "meters",
+    "table": "t_{dev}_{site}",
+    "tbname_key": "tbname",
+    "ts_field": "ts",
+    "ts_precision": "ms",
+    "columns": [
+      { "name": "current", "path": "current", "type": "number" },
+      { "name": "voltage", "path": "voltage", "type": "number" },
+      { "name": "running", "path": "running", "type": "bool" },
+      { "name": "note",    "path": "note",    "type": "string" }
+    ],
+    "tags": [
+      { "name": "device", "value": "{dev}" },
+      { "name": "site",   "value": "{site}" }
+    ]
+  }
+}
